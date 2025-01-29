@@ -5,6 +5,7 @@ setup(
     name="video2psp",
     version="0.1.0",
     packages=find_packages(),
+    url="https://github.com/ghurone/video2psp",
     entry_points={
         "console_scripts": [
             "video2psp=video2psp.psp:main",

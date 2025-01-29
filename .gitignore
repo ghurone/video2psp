@@ -1,1 +1,4 @@
 __pycache__
+build
+dist
+video2psp.egg-info
