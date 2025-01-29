@@ -98,6 +98,9 @@ def build_ffmpeg_command(
 
     cmd = [
         'ffmpeg',
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-stats',
         '-y',  # Overwrite sem perguntar
         '-i', input_file
     ]
@@ -164,6 +167,7 @@ def main():
     parser.add_argument(
         "output_file",
         type=str,
+        nargs='?',
         default=None,
         help="Path to output PSP-compatible MP4."
     )
@@ -278,7 +282,7 @@ def main():
     )
 
     print("\nRunning FFmpeg:")
-    print(" ".join(map(str, cmd)))
+    # print(" ".join(map(str, cmd)))
 
     try:
         subprocess.run(cmd, check=True)
