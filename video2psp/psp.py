@@ -5,10 +5,10 @@ import sys
 import os
 
 
-def ffprobe_streams(input_file:str) -> list:
+def ffprobe_streams(input_file: str) -> list[dict]:
     """
-    Return the streams information for the given file, as reported by ffprobe
-    (JSON).
+    Returns the information of all streams (video, audio, subtitles)
+    in the file, using ffprobe in JSON format.
     """
     probe_cmd = [
         'ffprobe',
@@ -17,278 +17,281 @@ def ffprobe_streams(input_file:str) -> list:
         '-show_streams',
         input_file
     ]
-
     try:
         result = subprocess.run(
             probe_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
+            text=True,
             check=True
         )
-        output = result.stdout.decode('utf-8', errors='replace')
-        return json.loads(output).get('streams', [])
-
+        data = json.loads(result.stdout)
+        return data.get('streams', [])
     except FileNotFoundError:
-        print("Error: 'ffprobe' not found. Make sure FFmpeg (with ffprobe) "
-              "is installed and in PATH.")
+        print("Error: 'ffprobe' not found. Check if FFmpeg is in the PATH.")
         sys.exit(1)
     except subprocess.CalledProcessError as e:
-        print(f"Error: ffprobe returned a non-zero exit status.\n{e}")
-        print("stderr:", e.stderr.decode('utf-8', errors='replace'))
+        print(f"Error: ffprobe returned a non-zero exit code.\n{e}")
+        print("stderr:", e.stderr)
         sys.exit(1)
     except json.JSONDecodeError:
         print("Error: Could not parse ffprobe output as JSON.")
         sys.exit(1)
 
 
-def list_tracks(input_file: str) -> tuple[list, list]:
+def get_tracks_by_type(streams: list[dict]):
     """
-    Return two lists: (audio_tracks, subtitle_tracks).
-    Each is a list of dicts with keys: ff_index (int), codec, language, title.
-    """
-    streams = ffprobe_streams(input_file)
+    From the raw ffprobe data, returns 3 lists:
+      - video_tracks
+      - audio_tracks
+      - subtitle_tracks
 
+    Each item in the lists is a dictionary:
+      {
+        "index_in_type": 0,   # relative position (0,1,2...) within that type
+        "codec_name": "h264",
+        "language": "eng",
+        "title": "..."
+      }
+
+    NOTE: We no longer store the global index. We will always use 'index_in_type'.
+    """
+    video_tracks = []
     audio_tracks = []
     subtitle_tracks = []
 
+    # Counters to generate "index_in_type"
+    v_count = 0
+    a_count = 0
+    s_count = 0
+
     for s in streams:
-        ff_index = s.get('index')
-        codec_type = s.get('codec_type')
-        codec_name = s.get('codec_name', 'unknown')
-        tags = s.get('tags', {})
-        language = tags.get('language', 'und')  # 'und' = undefined
-        title = tags.get('title', '')
+        codec_type = s.get("codec_type")
+        codec_name = s.get("codec_name", "unknown")
+        tags = s.get("tags", {})
+        language = tags.get("language", "und")
+        title = tags.get("title", "")
 
-        if codec_type == 'audio':
+        if codec_type == "video":
+            video_tracks.append({
+                "index_in_type": v_count,
+                "codec_name": codec_name,
+                "language": language,
+                "title": title
+            })
+            v_count += 1
+
+        elif codec_type == "audio":
             audio_tracks.append({
-                'ff_index': ff_index,
-                'codec': codec_name,
-                'language': language,
-                'title': title
+                "index_in_type": a_count,
+                "codec_name": codec_name,
+                "language": language,
+                "title": title
             })
-        elif codec_type == 'subtitle':
-            subtitle_tracks.append({
-                'ff_index': ff_index,
-                'codec': codec_name,
-                'language': language,
-                'title': title
-            })
+            a_count += 1
 
-    return audio_tracks, subtitle_tracks
+        elif codec_type == "subtitle":
+            subtitle_tracks.append({
+                "index_in_type": s_count,
+                "codec_name": codec_name,
+                "language": language,
+                "title": title
+            })
+            s_count += 1
+
+    return video_tracks, audio_tracks, subtitle_tracks
+
+
+def _choose_track_interactively(tracks: list[dict], track_type: str) -> int | None:
+    """
+    Asks the user which track (within that list) they want to use.
+    Returns the chosen 'index_in_type' or None if the user does not choose (for subtitles).
+    """
+    if not tracks:
+        return None
+
+    if len(tracks) == 1:
+        print(f"Only 1 {track_type.upper()} track detected. Selecting automatically.")
+        return tracks[0]['index_in_type']
+
+    print(f"\nAvailable {track_type.upper()} tracks ({len(tracks)}):")
+    for t in tracks:
+        i = t['index_in_type']
+        print(f"  [{i}] codec={t['codec_name']}, lang={t['language']}, title={t['title']}")
+
+    if track_type == 'subtitle':
+        print("Type -1 or leave blank to choose NO subtitles.")
+
+    while True:
+        user_input = input(f"Select the {track_type} track index (0..{len(tracks)-1}"
+                           + (", or -1 for none): " if track_type == 'subtitle' else "): "))
+        user_input = user_input.strip()
+
+        if track_type == 'subtitle' and user_input == '':
+            user_input = '-1'  # if only enter is pressed
+
+        try:
+            idx = int(user_input)
+            if track_type == 'subtitle' and idx == -1:
+                return None
+            if 0 <= idx < len(tracks):
+                return idx
+            else:
+                print("Value out of range. Try again.")
+        except ValueError:
+            print("Invalid input. Try again.")
 
 
 def build_ffmpeg_command(
-        input_file:str,
-        output_file:str,
-        audio_track_index:str,
-        subtitle_track_index:str = None,
-        external_subs:str = None
-        
+    input_file: str,
+    output_file: str,
+    video_index: int,
+    audio_index: int,
+    subtitle_index: int | None = None,
+    external_subs: str | None = None
 ) -> list[str]:
+    
     """
-    Build an ffmpeg command for PSP-compatible MP4 with chosen audio track
-    (re-encoded), and optionally burn in a chosen subtitle track or external
-    subtitle file.
+    Generates an ffmpeg command that maps the relative video and audio:
+       -map 0:v:<video_index>
+       -map 0:a:<audio_index>
 
-    - audio_track_index (int): Ex: 1 significa '0:1' no ffmpeg.
-    - subtitle_track_index (int): Ex: 2 significa '0:2', ou None para não usar.
-    - external_subs (str): caminho para .srt/.ass externo; se setado,
-      ignora legendas embutidas.
+    Burns subtitles (either external or embedded).
+    subtitle_index is the relative index among the subtitle tracks (0,1,2...).
     """
-
     cmd = [
         'ffmpeg',
         '-hide_banner',
         '-loglevel', 'error',
         '-stats',
-        '-y',  # Overwrite sem perguntar
+        '-y',
         '-i', input_file
     ]
 
-    # Mapeia o primeiro track de vídeo (geralmente 0:v:0)
-    cmd += ['-map', '0:v:0']
-    # Mapeia o track de áudio escolhido (0:a:<índiceGlobal>)
-    cmd += ['-map', f'0:{audio_track_index}']
+    cmd += ['-map', f'0:v:{video_index}']
+    cmd += ['-map', f'0:a:{audio_index}']
 
-    # Filtro base para escalonar para resolução do PSP (largura=480, altura ajustada)
     base_vf = "scale=480:-2"
-
-    vf_filter = base_vf  # padrão (sem legendas)
+    vf_filter = base_vf
 
     if external_subs:
-        # Legenda externa
-        vf_filter = f"{base_vf},subtitles='{external_subs}'"
-    elif subtitle_track_index is not None:
-        audio_tracks, subtitle_tracks = list_tracks(input_file)
+        ext_sub_escaped = external_subs.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        vf_filter += f",subtitles='{ext_sub_escaped}'"
+    elif subtitle_index is not None:
+        input_escaped = input_file.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        vf_filter += f",subtitles='{input_escaped}:si={subtitle_index}'"
 
-        sub_order = None
-        for i, st in enumerate(subtitle_tracks):
-            if st['ff_index'] == subtitle_track_index:
-                sub_order = i
-                break
-
-        if sub_order is None:
-            print("Warning: Could not find the specified subtitle track "
-                  "among embedded subtitles.")
-            print("Skipping subtitle burn-in.")
-        else:
-            vf_filter = f"{base_vf},subtitles='{input_file}:si={sub_order}'"
-
-    cmd += ['-vf', vf_filter]
-
-    # Configurações de encoding para PSP (H.264 baseline, ~768kbps, AAC 128kbps)
     cmd += [
+        '-vf', vf_filter,
         '-c:v', 'libx264',
         '-profile:v', 'baseline',
         '-level:v', '3.0',
         '-b:v', '768k',
         '-maxrate', '768k',
         '-bufsize', '2000k',
-        '-r', '29.97',  # framerate PSP comum
+        '-r', '29.97',
         '-c:a', 'aac',
         '-b:a', '128k',
-        '-ac', '2',  # stereo
+        '-ac', '2',
         output_file
     ]
 
     return cmd
 
 
+def print_title() -> None:
+    print("+--------------------------------------------- +")
+    print("| video2psp - A video converter for PSP format |")
+    print("+--------------------------------------------- +")
+    print("by Erick Ghuron\n")
+    
+    
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert video to PSP MP4 with user-selected audio and "
-                    "subtitle tracks."
-    )
-    parser.add_argument(
-        "input_file",
-        type=str,
-        help="Path to input video."
-    )
-    parser.add_argument(
-        "output_file",
-        type=str,
-        nargs='?',
-        default=None,
-        help="Path to output PSP-compatible MP4."
-    )
-    parser.add_argument(
-        "--audio-track",
-        type=int,
-        default=None,
-        help="Global ffmpeg index of the audio track you want to use "
-             "(e.g. 1 for '0:1')."
-    )
-    parser.add_argument(
-        "--subtitle-track",
-        type=int,
-        default=None,
-        help="Global ffmpeg index of an embedded subtitle track to burn in "
-             "(e.g. 2 for '0:2')."
-    )
-    parser.add_argument(
-        "--external-subs",
-        help="Path to an external .srt/.ass file for burning into the video "
-             "(overrides embedded).",
-        default=None,
-        type=str
-    )
+        description="Convert video to PSP MP4 with user-selected video, audio and subtitle tracks."
+        )
+                                     
+    parser.add_argument("input_file", type=str, help="Input file")
+    parser.add_argument("output_file", type=str, nargs='?', default=None,
+                        help="Output file (optional, default = input + .mp4)")
+    parser.add_argument("--video-track", type=int, default=None,
+                        help="Relative index of the video track (0,1,2...)")
+    parser.add_argument("--audio-track", type=int, default=None,
+                        help="Relative index of the audio track (0,1,2...)")
+    parser.add_argument("--subtitle-track", type=int, default=None,
+                        help="Relative index of the subtitle track (0,1,2...) to burn.")
+    parser.add_argument("--external-subs", type=str, default=None,
+                        help="External subtitles (srt, ass) to burn into the video (takes priority over embedded).")
 
+    print_title()
+    
     args = parser.parse_args()
 
     input_file = args.input_file
-    base, _ = os.path.splitext(input_file)
-    output_file = args.output_file if args.output_file else f"{base}.mp4"
-    audio_track_index = args.audio_track
-    subtitle_track_index = args.subtitle_track
-    external_subs = args.external_subs
+    if not args.output_file:
+        base, _ = os.path.splitext(input_file)
+        output_file = base + ".mp4"
+    else:
+        output_file = args.output_file
 
-    audio_tracks, subtitle_tracks = list_tracks(input_file)
+    streams = ffprobe_streams(input_file)
+    video_tracks, audio_tracks, subtitle_tracks = get_tracks_by_type(streams)
 
-    if not audio_tracks:
-        print("Error: No audio tracks found in the input file. Exiting.")
+    if not video_tracks:
+        print("Error: there are no VIDEO tracks in the file.")
         sys.exit(1)
 
-    if audio_track_index is None:
-        if len(audio_tracks) == 1:
-            print('Detected 1 AUDIO track!')
-            audio_track_index = audio_tracks[0]['ff_index']
+    if not audio_tracks:
+        print("Error: there are no AUDIO tracks in the file.")
+        sys.exit(1)
+
+    if args.video_track is None:
+        video_index = _choose_track_interactively(video_tracks, "video")
+    else:
+        video_index = args.video_track
+        if video_index < 0 or video_index >= len(video_tracks):
+            print(f"Error: invalid video index {video_index}. Only {len(video_tracks)} tracks found.")
+            sys.exit(1)
+
+    if args.audio_track is None:
+        audio_index = _choose_track_interactively(audio_tracks, "audio")
+    else:
+        audio_index = args.audio_track
+        if audio_index < 0 or audio_index >= len(audio_tracks):
+            print(f"Error: invalid audio index {audio_index}. Only {len(audio_tracks)} tracks found.")
+            sys.exit(1)
+
+    if args.external_subs:
+        subtitle_index = None
+    else:
+        if not subtitle_tracks:
+            subtitle_index = None
         else:
-            print(f"Detected ({len(audio_tracks)}) the following AUDIO tracks:")
-            for i, t in enumerate(audio_tracks):
-                print(
-                    f"  [{i}]  ff_index=0:{t['ff_index']}, "
-                    f"codec={t['codec']}, "
-                    f"lang={t['language']}, "
-                    f"title={t['title']}"
-                )
-
-            while True:
-                user_choice = input(
-                    f"Select which audio track (0 to {len(audio_tracks)-1}): "
-                )
-                try:
-                    user_choice_int = int(user_choice)
-                    if 0 <= user_choice_int < len(audio_tracks):
-                        audio_track_index = audio_tracks[user_choice_int]['ff_index']
-                        break
-                    else:
-                        print("Invalid choice. Try again.")
-                except ValueError:
-                    print("Invalid input. Try again.")
-
-    if external_subs is None and subtitle_track_index is None:
-        if subtitle_tracks:
-            print("\nDetected the following SUBTITLE tracks:")
-            for i, st in enumerate(subtitle_tracks):
-                print(
-                    f"  [{i}]  ff_index=0:{st['ff_index']}, "
-                    f"codec={st['codec']}, lang={st['language']}, "
-                    f"title={st['title']}"
-                )
-            print("Enter -1 (or leave blank) if you do not want to burn any "
-                  "embedded subtitles.")
-
-            while True:
-                user_sub_choice = input(
-                    f"Select which subtitle track (0 to {len(subtitle_tracks)-1} "
-                    f"or -1): "
-                )
-                if user_sub_choice.strip() == '':
-                    user_sub_choice = '-1'
-
-                try:
-                    user_sub_choice_int = int(user_sub_choice)
-                    if user_sub_choice_int == -1:
-                        subtitle_track_index = None
-                        break
-                    elif 0 <= user_sub_choice_int < len(subtitle_tracks):
-                        subtitle_track_index = (
-                            subtitle_tracks[user_sub_choice_int]['ff_index']
-                        )
-                        break
-                    else:
-                        print("Invalid choice. Try again.")
-                except ValueError:
-                    print("Invalid input. Try again.")
-        else:
-            print("\nNo embedded subtitle tracks found.")
+            if args.subtitle_track is None:
+                subtitle_index = _choose_track_interactively(subtitle_tracks, "subtitle")
+            else:
+                st_idx = args.subtitle_track
+                if 0 <= st_idx < len(subtitle_tracks):
+                    subtitle_index = st_idx
+                else:
+                    print(f"Warning: invalid subtitle index {st_idx}. No subtitles will be burned.")
+                    subtitle_index = None
 
     cmd = build_ffmpeg_command(
         input_file=input_file,
         output_file=output_file,
-        audio_track_index=audio_track_index,
-        subtitle_track_index=subtitle_track_index,
-        external_subs=external_subs
+        video_index=video_index,
+        audio_index=audio_index,
+        subtitle_index=subtitle_index,
+        external_subs=args.external_subs
     )
 
-    print("\nRunning FFmpeg:")
-    # print(" ".join(map(str, cmd)))
+    print("\nRunning FFmpeg...")
 
     try:
         subprocess.run(cmd, check=True)
-        print(f"\nSuccessfully created PSP video: {output_file}")
+        print(f"\nFile generated: {output_file}")
     except subprocess.CalledProcessError as e:
-        print("\nError: FFmpeg command failed.")
+        print("Failed to run ffmpeg:")
         print(e)
 
 

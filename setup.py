@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="video2psp",
-    version="0.1.1",
+    version="0.2.0",
     packages=find_packages(),
     url="https://github.com/ghurone/video2psp",
     entry_points={
