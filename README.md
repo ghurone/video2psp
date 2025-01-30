@@ -23,10 +23,10 @@ With the tool installed, simply run:
 ```bash
 video2psp <input_video> <output_video> [options]
 ```
-- If you do **not** specify `--audio-track` or `--subtitle-track`, the script will prompt you to pick which tracks to use.  
+- If you do **not** specify `--video-track`, `--audio-track` or `--subtitle-track`, the script will prompt you to pick which tracks to use.  
 - To skip prompts, you can set them explicitly, for example:
   ```bash
-  video2psp movie.mkv out.mp4 --audio-track 1 --subtitle-track 2
+  video2psp movie.mkv out.mp4 --video-track 0 --audio-track 0 --subtitle-track 1
   ```
 - To burn an external subtitle file instead of an embedded track:
   ```bash
@@ -37,7 +37,7 @@ video2psp <input_video> <output_video> [options]
 
 - The **PSP** typically supports H.264 Baseline Level 3.0 with AAC audio.  
 - Resolution is scaled to **480 pixels wide** (height adjusted automatically) to match PSP screen specs.  
-- Only **one** audio track is included, and **one** subtitle track can be burned.  
+- Only **one** video and auido track is included, and **one** subtitle track can be burned.  
 - For image-based subtitles (like PGS or VobSub), you need to convert them to a text format (e.g., SRT) before burning.
 
 Feel free to contribute or customize further. Enjoy converting videos for your PSP!
