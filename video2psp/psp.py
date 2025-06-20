@@ -367,9 +367,9 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s input.mkv
-  %(prog)s input.mkv output.mp4 --video-track 0 --audio-track 1
-  %(prog)s input.mkv --external-subs subtitles.srt
+  %(prog)s input.ext
+  %(prog)s input.ext output.mp4 --video-track 0 --audio-track 1
+  %(prog)s input.ext --external-subs subtitles.srt
         """
     )
     
