@@ -37,7 +37,7 @@ video2psp <input_video> <output_video> [options]
 
 - The **PSP** typically supports H.264 Baseline Level 3.0 with AAC audio.  
 - Resolution is scaled to **480 pixels wide** (height adjusted automatically) to match PSP screen specs.  
-- Only **one** video and auido track is included, and **one** subtitle track can be burned.  
+- Only **one** video and audio track is included, and **one** subtitle track can be burned.  
 - For image-based subtitles (like PGS or VobSub), you need to convert them to a text format (e.g., SRT) before burning.
 
 Feel free to contribute or customize further. Enjoy converting videos for your PSP!
