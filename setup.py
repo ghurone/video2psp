@@ -1,9 +1,13 @@
 # setup.py
+from pathlib import Path
+
 from setuptools import setup, find_packages
+
+long_description = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="video2psp",
-    version="0.3.1",
+    version="0.4.0",
     packages=find_packages(),
     url="https://github.com/ghurone/video2psp",
     entry_points={
@@ -13,6 +17,12 @@ setup(
     },
     author="Erick Ghuron",
     author_email="ghuron@usp.br",
-    description="A CLI tool to convert video to PSP MP4 with user-selected audio and subtitle tracks.",
+    description=(
+        "CLI tool to convert videos into PSP-compatible MP4, with interactive "
+        "track selection, subtitle burn-in, volume adjustment, and CRF-based "
+        "quality control."
+    ),
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     python_requires=">=3.11",
 )

@@ -20,9 +20,9 @@ class PSPVideoConverter:
     """PSP Video Converter class to handle video conversion operations."""
     
     def __init__(self):
-        self.video_tracks = []
-        self.audio_tracks = []
-        self.subtitle_tracks = []
+        self.video_tracks: List[Dict] = []
+        self.audio_tracks: List[Dict] = []
+        self.subtitle_tracks: List[Dict] = []
     
     def ffprobe_streams(self, input_file: str) -> List[Dict]:
         """
@@ -206,11 +206,14 @@ class PSPVideoConverter:
         video_index: int,
         audio_index: int,
         subtitle_index: Optional[int] = None,
-        external_subs: Optional[str] = None
+        external_subs: Optional[str] = None,
+        volume_factor: float = 1.0,
+        preset: str = "medium",
+        crf: int = 23
     ) -> List[str]:
         """
         Generates an ffmpeg command for PSP conversion.
-        
+
         Args:
             input_file: Input video file path
             output_file: Output video file path
@@ -218,7 +221,12 @@ class PSPVideoConverter:
             audio_index: Index of audio track to use
             subtitle_index: Index of subtitle track to burn (optional)
             external_subs: Path to external subtitle file (optional)
-            
+            volume_factor: Volume multiplication factor (default: 1.0)
+            preset: libx264 encoding preset, trades speed for compression (default: medium)
+            crf: Constant Rate Factor for quality-based encoding, lower is higher quality
+                and larger file size (default: 23). -maxrate/-bufsize still cap the peak
+                bitrate so the PSP's decoder buffer requirements are respected.
+
         Returns:
             List of command arguments for ffmpeg
         """
@@ -234,8 +242,46 @@ class PSPVideoConverter:
         cmd.extend(['-map', f'0:v:{video_index}'])
         cmd.extend(['-map', f'0:a:{audio_index}'])
 
-        vf_filter = "scale=480:-2"  
-        
+        vf_filter = self._build_video_filter(input_file, subtitle_index, external_subs)
+
+        cmd.extend([
+            '-vf', vf_filter,
+            '-c:v', 'libx264',
+            '-preset', preset,
+            '-profile:v', 'baseline',
+            '-level:v', '3.0',
+            '-crf', str(crf),
+            '-maxrate', '768k',
+            '-bufsize', '2000k',
+            '-r', '29.97',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-ac', '2',
+            '-ar', '48000'
+        ])
+
+        if volume_factor != 1.0:
+            cmd.extend(['-af', f'volume={volume_factor}'])
+
+        cmd.extend([
+            '-movflags', '+faststart',
+            output_file
+        ])
+
+        return cmd
+
+    def _build_video_filter(
+        self,
+        input_file: str,
+        subtitle_index: Optional[int],
+        external_subs: Optional[str]
+    ) -> str:
+        """Build the -vf filter string, including subtitle burn-in if requested."""
+        vf_filter = (
+            "scale=480:272:force_original_aspect_ratio=decrease,"
+            "pad=480:272:(ow-iw)/2:(oh-ih)/2"
+        )
+
         if external_subs:
             if not Path(external_subs).exists():
                 raise VideoConverterError(f"External subtitle file not found: {external_subs}")
@@ -244,24 +290,8 @@ class PSPVideoConverter:
         elif subtitle_index is not None:
             input_escaped = self._escape_filter_string(input_file)
             vf_filter += f",subtitles='{input_escaped}:si={subtitle_index}'"
-        
-        cmd.extend([
-            '-vf', vf_filter,
-            '-c:v', 'libx264',
-            '-profile:v', 'baseline',
-            '-level:v', '3.0',
-            '-b:v', '768k',
-            '-maxrate', '768k',
-            '-bufsize', '2000k',
-            '-r', '29.97',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-ac', '2', 
-            '-movflags', '+faststart', 
-            output_file
-        ])
-        
-        return cmd
+
+        return vf_filter
     
     def _escape_filter_string(self, path: str) -> str:
         """Escape special characters for FFmpeg filter strings."""
@@ -274,11 +304,14 @@ class PSPVideoConverter:
         video_track: Optional[int] = None,
         audio_track: Optional[int] = None,
         subtitle_track: Optional[int] = None,
-        external_subs: Optional[str] = None
+        external_subs: Optional[str] = None,
+        volume_factor: float = 1.0,
+        preset: str = "medium",
+        crf: int = 23
     ) -> None:
         """
         Main conversion method.
-        
+
         Args:
             input_file: Path to input video file
             output_file: Path to output file (optional)
@@ -286,6 +319,9 @@ class PSPVideoConverter:
             audio_track: Audio track index (optional, will prompt if not provided)
             subtitle_track: Subtitle track index (optional)
             external_subs: External subtitle file path (optional)
+            volume_factor: Volume multiplication factor (default: 1.0)
+            preset: libx264 encoding preset, trades speed for compression (default: medium)
+            crf: Constant Rate Factor for quality-based encoding (default: 23)
         """
         input_path = Path(input_file)
         if not input_path.exists():
@@ -293,7 +329,12 @@ class PSPVideoConverter:
 
         if not output_file:
             output_file = str(input_path.with_suffix('.mp4'))
-        
+
+        if Path(output_file).exists():
+            answer = input(f"Output file '{output_file}' already exists. Overwrite? [y/N]: ").strip().lower()
+            if answer not in ('y', 'yes'):
+                raise VideoConverterError("Conversion cancelled: output file already exists.")
+
         print("Analyzing input file...")
         streams = self.ffprobe_streams(input_file)
         video_tracks, audio_tracks, subtitle_tracks = self.get_tracks_by_type(streams)
@@ -305,8 +346,7 @@ class PSPVideoConverter:
         
         video_index = self._select_track(video_tracks, video_track, "video")
         audio_index = self._select_track(audio_tracks, audio_track, "audio")
-        
-        
+
         subtitle_index = None
         if external_subs:
             print(f"Using external subtitles: {external_subs}")
@@ -319,6 +359,9 @@ class PSPVideoConverter:
             else:
                 subtitle_index = self.choose_track_interactively(subtitle_tracks, "subtitle")
         
+        # Show volume factor if different from default
+        if volume_factor != 1.0:
+            print(f"Audio volume will be adjusted by factor: {volume_factor}")
         
         cmd = self.build_ffmpeg_command(
             input_file=input_file,
@@ -326,9 +369,12 @@ class PSPVideoConverter:
             video_index=video_index,
             audio_index=audio_index,
             subtitle_index=subtitle_index,
-            external_subs=external_subs
+            external_subs=external_subs,
+            volume_factor=volume_factor,
+            preset=preset,
+            crf=crf
         )
-        
+
         print("\nStarting conversion...")
         print(f"Output: {output_file}")
         
@@ -349,8 +395,11 @@ class PSPVideoConverter:
                     f"Invalid {track_type} track index {specified_index}. "
                     f"Available range: 0-{len(tracks)-1}"
                 )
-        
-        return self.choose_track_interactively(tracks, track_type)
+
+        selected = self.choose_track_interactively(tracks, track_type)
+        if selected is None:
+            raise VideoConverterError(f"No {track_type} track available to select.")
+        return selected
 
 
 def print_title() -> None:
@@ -362,6 +411,11 @@ def print_title() -> None:
 
 def main() -> None:
     """Main entry point."""
+    if any(arg in ("--gui", "-g") for arg in sys.argv[1:]):
+        from video2psp.gui import launch_gui
+        launch_gui()
+        return
+
     parser = argparse.ArgumentParser(
         description="Convert video files to PSP-compatible MP4 format with user-selected tracks.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -370,9 +424,14 @@ Examples:
   %(prog)s input.ext
   %(prog)s input.ext output.mp4 --video-track 0 --audio-track 1
   %(prog)s input.ext --external-subs subtitles.srt
+  %(prog)s input.ext --volume 1.5
+  %(prog)s input.ext --volume 0.8 --audio-track 1
+  %(prog)s input.ext --preset veryfast
+  %(prog)s input.ext --crf 26
+  %(prog)s --gui
         """
     )
-    
+
     parser.add_argument(
         "input_file",
         help="Input video file path"
@@ -401,12 +460,42 @@ Examples:
         "--external-subs",
         help="External subtitle file to burn into video (takes priority over embedded subtitles)"
     )
-    
+    parser.add_argument(
+        "--volume",
+        type=float,
+        default=1.0,
+        help="Volume multiplication factor (1.0 = original, 1.5 = 150%%, 0.5 = 50%%, default: 1.0)"
+    )
+    parser.add_argument(
+        "--preset",
+        choices=[
+            "ultrafast", "superfast", "veryfast", "faster",
+            "fast", "medium", "slow", "slower", "veryslow"
+        ],
+        default="medium",
+        help="libx264 encoding preset, trades encoding speed for compression efficiency (default: medium)"
+    )
+    parser.add_argument(
+        "--crf",
+        type=int,
+        default=23,
+        help="Constant Rate Factor (0-51): lower means higher quality and larger file size, "
+             "higher means smaller file and lower quality (default: 23)"
+    )
+
     print_title()
-    
+
     try:
         args = parser.parse_args()
-        
+
+        # Validate volume factor
+        if args.volume <= 0:
+            raise VideoConverterError("Volume factor must be greater than 0")
+
+        # Validate CRF range
+        if not 0 <= args.crf <= 51:
+            raise VideoConverterError("CRF must be between 0 and 51")
+
         converter = PSPVideoConverter()
         converter.convert_video(
             input_file=args.input_file,
@@ -414,7 +503,10 @@ Examples:
             video_track=args.video_track,
             audio_track=args.audio_track,
             subtitle_track=args.subtitle_track,
-            external_subs=args.external_subs
+            external_subs=args.external_subs,
+            volume_factor=args.volume,
+            preset=args.preset,
+            crf=args.crf
         )
         
     except VideoConverterError as e:

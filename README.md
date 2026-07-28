@@ -19,6 +19,16 @@ pip install video2psp
 
 ## Usage
 
+### GUI
+
+Prefer a graphical interface? Run:
+```bash
+video2psp --gui
+```
+(`-g` also works). This opens a window where you can pick the input/output files, choose tracks, and tweak volume/preset/CRF without touching the terminal.
+
+### CLI
+
 With the tool installed, simply run:
 ```bash
 video2psp <input_video> <output_video> [options]
@@ -32,11 +42,25 @@ video2psp <input_video> <output_video> [options]
   ```bash
   video2psp movie.mkv out.mp4 --external-subs subs.srt
   ```
+- To adjust audio volume (e.g. 150%):
+  ```bash
+  video2psp movie.mkv out.mp4 --volume 1.5
+  ```
+- To trade encoding speed for compression efficiency (default: `medium`):
+  ```bash
+  video2psp movie.mkv out.mp4 --preset veryfast
+  ```
+  Available presets (slowest/best compression to fastest): `veryslow`, `slower`, `slow`, `medium`, `fast`, `faster`, `veryfast`, `superfast`, `ultrafast`.
+- To control video quality/file size via CRF (0-51, lower = higher quality and larger file, default: `23`):
+  ```bash
+  video2psp movie.mkv out.mp4 --crf 26
+  ```
+  Video is encoded at a constant quality target rather than a fixed bitrate, so simple scenes take up less space; `-maxrate`/`-bufsize` still cap the peak bitrate to respect the PSP's decoder buffer limits.
   
 ## Notes & Limitations
 
 - The **PSP** typically supports H.264 Baseline Level 3.0 with AAC audio.  
-- Resolution is scaled to **480 pixels wide** (height adjusted automatically) to match PSP screen specs.  
+- Resolution is scaled to fit within **480x272** (PSP screen size), preserving aspect ratio and padding with black bars as needed.  
 - Only **one** video and audio track is included, and **one** subtitle track can be burned.  
 - For image-based subtitles (like PGS or VobSub), you need to convert them to a text format (e.g., SRT) before burning.
 
