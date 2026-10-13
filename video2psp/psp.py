@@ -7,59 +7,160 @@ import argparse
 import json
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+
+PRESETS = [
+    "ultrafast", "superfast", "veryfast", "faster",
+    "fast", "medium", "slow", "slower", "veryslow",
+]
+DEFAULT_PRESET = "medium"
+DEFAULT_CRF = 23
+
+PSP_WIDTH = 480
+PSP_HEIGHT = 272
+
+# Bitmap subtitle codecs can't be rendered by the `subtitles` (libass) filter.
+IMAGE_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
 
 
 class VideoConverterError(Exception):
     """Custom exception for video converter errors."""
-    pass
+
+
+@dataclass
+class Track:
+    """A single stream of a given type (video, audio or subtitle)."""
+    kind: str
+    index: int  # index among streams of the same kind (used in -map 0:v:N etc.)
+    codec_name: str = "unknown"
+    language: str = "und"
+    title: str = ""
+    width: int = 0
+    height: int = 0
+    fps: str = "unknown"
+    channels: int = 0
+    sample_rate: str = "unknown"
+
+    @property
+    def is_image_subtitle(self) -> bool:
+        return self.kind == "subtitle" and self.codec_name in IMAGE_SUBTITLE_CODECS
+
+    def label(self) -> str:
+        """Human-readable one-line description, shared by CLI and GUI."""
+        label = f"[{self.index}] {self.codec_name}"
+        if self.language and self.language != "und":
+            label += f", {self.language}"
+        if self.title:
+            label += f', "{self.title}"'
+        if self.kind == "video":
+            label += f", {self.width}x{self.height}, {self.fps}fps"
+        elif self.kind == "audio":
+            label += f", {self.channels}ch, {self.sample_rate}Hz"
+        elif self.is_image_subtitle:
+            label += " (image-based, not supported)"
+        return label
+
+
+@dataclass
+class MediaInfo:
+    """Tracks and duration of a media file, obtained from a single ffprobe call."""
+    video: list[Track] = field(default_factory=list)
+    audio: list[Track] = field(default_factory=list)
+    subtitle: list[Track] = field(default_factory=list)
+    duration: float = 0.0
+
+
+def _parse_fps(rate: str) -> str:
+    try:
+        num, den = map(int, rate.split("/"))
+        return f"{num / den:.2f}"
+    except (ValueError, ZeroDivisionError):
+        return "unknown"
+
+
+def parse_streams(data: dict) -> MediaInfo:
+    """Build a MediaInfo from ffprobe's JSON output (-show_streams -show_format)."""
+    info = MediaInfo()
+    by_kind = {"video": info.video, "audio": info.audio, "subtitle": info.subtitle}
+
+    for stream in data.get("streams", []):
+        tracks = by_kind.get(stream.get("codec_type"))
+        if tracks is None:
+            continue
+        tags = stream.get("tags", {})
+        tracks.append(Track(
+            kind=stream["codec_type"],
+            index=len(tracks),
+            codec_name=stream.get("codec_name", "unknown"),
+            language=tags.get("language", "und"),
+            title=tags.get("title", ""),
+            width=stream.get("width", 0),
+            height=stream.get("height", 0),
+            fps=_parse_fps(stream.get("r_frame_rate", "0/0")),
+            channels=stream.get("channels", 0),
+            sample_rate=stream.get("sample_rate", "unknown"),
+        ))
+
+    try:
+        info.duration = float(data.get("format", {}).get("duration") or 0.0)
+    except ValueError:
+        info.duration = 0.0
+    return info
+
+
+def escape_filter_value(value: str) -> str:
+    """
+    Escape a value to be used as a filter option inside a filtergraph (-vf).
+
+    FFmpeg applies two levels of unescaping: first the filtergraph parser,
+    then the filter's option parser. Quoting with '...' can't represent an
+    apostrophe, so we escape everything instead (see "Notes on filtergraph
+    escaping" in the ffmpeg-filters docs).
+    """
+    for ch in "\\':":
+        value = value.replace(ch, "\\" + ch)
+    for ch in "\\'[],;":
+        value = value.replace(ch, "\\" + ch)
+    return value
+
+
+def default_output_path(input_file: str | Path) -> Path:
+    """Input path with .mp4 extension, never the input file itself."""
+    input_path = Path(input_file)
+    output = input_path.with_suffix(".mp4")
+    if output.resolve() == input_path.resolve():
+        output = input_path.with_name(f"{input_path.stem}_psp.mp4")
+    return output
 
 
 class PSPVideoConverter:
     """PSP Video Converter class to handle video conversion operations."""
-    
-    def __init__(self):
-        self.video_tracks: List[Dict] = []
-        self.audio_tracks: List[Dict] = []
-        self.subtitle_tracks: List[Dict] = []
-    
-    def ffprobe_streams(self, input_file: str) -> List[Dict]:
+
+    def probe(self, input_file: str) -> MediaInfo:
         """
-        Returns the information of all streams (video, audio, subtitles)
-        in the file, using ffprobe in JSON format.
-        
-        Args:
-            input_file: Path to the input video file
-            
-        Returns:
-            List of stream dictionaries
-            
+        Returns tracks and duration of the file using a single ffprobe call.
+
         Raises:
             VideoConverterError: If ffprobe fails or file is not found
         """
         if not Path(input_file).exists():
             raise VideoConverterError(f"Input file does not exist: {input_file}")
-        
+
         probe_cmd = [
-            'ffprobe',
-            '-v', 'quiet',
-            '-print_format', 'json',
-            '-show_streams',
-            input_file
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-show_format",
+            input_file,
         ]
-        
+
         try:
             result = subprocess.run(
-                probe_cmd,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=30 
+                probe_cmd, capture_output=True, text=True, check=True, timeout=30
             )
-            data = json.loads(result.stdout)
-            return data.get('streams', [])
-            
+            return parse_streams(json.loads(result.stdout))
         except FileNotFoundError:
             raise VideoConverterError(
                 "ffprobe not found. Please install FFmpeg and ensure it's in your PATH."
@@ -72,145 +173,65 @@ class PSPVideoConverter:
             raise VideoConverterError("ffprobe timed out after 30 seconds.")
         except json.JSONDecodeError:
             raise VideoConverterError("Could not parse ffprobe output as JSON.")
-    
-    def get_tracks_by_type(self, streams: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
-        """
-        From the raw ffprobe data, returns 3 lists organized by type.
-        
-        Args:
-            streams: List of stream dictionaries from ffprobe
-            
-        Returns:
-            Tuple of (video_tracks, audio_tracks, subtitle_tracks)
-        """
-        video_tracks = []
-        audio_tracks = []
-        subtitle_tracks = []
-        
-        counters = {'video': 0, 'audio': 0, 'subtitle': 0}
-        
-        for stream in streams:
-            codec_type = stream.get("codec_type")
-            if codec_type not in counters:
-                continue
-                
-            codec_name = stream.get("codec_name", "unknown")
-            tags = stream.get("tags", {})
-            language = tags.get("language", "und")
-            title = tags.get("title", "")
-            
-            track_info = {
-                "index_in_type": counters[codec_type],
-                "codec_name": codec_name,
-                "language": language,
-                "title": title
-            }
-            
-            if codec_type == "video":
-                track_info.update({
-                    "width": stream.get("width", 0),
-                    "height": stream.get("height", 0),
-                    "fps": self._get_fps(stream)
-                })
-                video_tracks.append(track_info)
-            elif codec_type == "audio":
-                track_info.update({
-                    "channels": stream.get("channels", 0),
-                    "sample_rate": stream.get("sample_rate", "unknown")
-                })
-                audio_tracks.append(track_info)
-            elif codec_type == "subtitle":
-                subtitle_tracks.append(track_info)
-                
-            counters[codec_type] += 1
-        
-        self.video_tracks = video_tracks
-        self.audio_tracks = audio_tracks
-        self.subtitle_tracks = subtitle_tracks
-        
-        return video_tracks, audio_tracks, subtitle_tracks
-    
-    def _get_fps(self, stream: Dict) -> str:
-        """Extract FPS from stream data."""
-        fps_str = stream.get("r_frame_rate", "0/0")
-        try:
-            if "/" in fps_str:
-                num, den = map(int, fps_str.split("/"))
-                if den != 0:
-                    return f"{num/den:.2f}"
-        except (ValueError, ZeroDivisionError):
-            pass
-        return "unknown"
-    
-    def choose_track_interactively(self, tracks: List[Dict], track_type: str) -> Optional[int]:
+
+    def choose_track_interactively(self, tracks: list[Track], track_type: str) -> int | None:
         """
         Asks the user which track they want to use.
-        
-        Args:
-            tracks: List of available tracks
-            track_type: Type of track ("video", "audio", "subtitle")
-            
+
         Returns:
             Chosen track index or None for subtitles if user declines
         """
         if not tracks:
             return None
-        
-        if len(tracks) == 1 and track_type != 'subtitle':
+
+        if len(tracks) == 1 and track_type != "subtitle":
             print(f"Only 1 {track_type.upper()} track detected. Selecting automatically.")
-            return tracks[0]['index_in_type']
-        
+            return tracks[0].index
+
         print(f"\nAvailable {track_type.upper()} tracks ({len(tracks)}):")
         for track in tracks:
-            idx = track['index_in_type']
-            info = f"[{idx}] codec={track['codec_name']}, lang={track['language']}"
-            
-            if track['title']:
-                info += f", title='{track['title']}'"
-            
-            if track_type == 'video':
-                info += f", resolution={track['width']}x{track['height']}, fps={track['fps']}"
-            elif track_type == 'audio':
-                info += f", channels={track['channels']}, sample_rate={track['sample_rate']}"
-                
-            print(f"  {info}")
-        
-        if track_type == 'subtitle':
+            print(f"  {track.label()}")
+
+        if track_type == "subtitle":
             print("Enter -1 or leave blank to choose NO subtitles.")
-        
+
         max_idx = len(tracks) - 1
+        prompt = f"Select the {track_type} track index (0-{max_idx}"
+        if track_type == "subtitle":
+            prompt += ", or -1 for none"
+        prompt += "): "
+
         while True:
-            prompt = f"Select the {track_type} track index (0-{max_idx}"
-            if track_type == 'subtitle':
-                prompt += ", or -1 for none"
-            prompt += "): "
-            
             user_input = input(prompt).strip()
-            
-            if track_type == 'subtitle' and user_input in ('', '-1'):
+
+            if track_type == "subtitle" and user_input in ("", "-1"):
                 return None
-            
+
             try:
                 idx = int(user_input)
-                if 0 <= idx <= max_idx:
-                    return idx
-                else:
-                    print(f"Value out of range (0-{max_idx}). Try again.")
             except ValueError:
                 print("Invalid input. Please enter a number.")
-    
+                continue
+            if not 0 <= idx <= max_idx:
+                print(f"Value out of range (0-{max_idx}). Try again.")
+            elif tracks[idx].is_image_subtitle:
+                print("Image-based subtitles can't be burned. Pick another track or -1.")
+            else:
+                return idx
+
     def build_ffmpeg_command(
         self,
         input_file: str,
         output_file: str,
         video_index: int,
         audio_index: int,
-        subtitle_index: Optional[int] = None,
-        external_subs: Optional[str] = None,
+        subtitle_index: int | None = None,
+        external_subs: str | None = None,
         volume_factor: float = 1.0,
-        preset: str = "medium",
-        crf: int = 23
-    ) -> List[str]:
+        preset: str = DEFAULT_PRESET,
+        crf: int = DEFAULT_CRF,
+        progress: bool = False,
+    ) -> list[str]:
         """
         Generates an ffmpeg command for PSP conversion.
 
@@ -226,88 +247,80 @@ class PSPVideoConverter:
             crf: Constant Rate Factor for quality-based encoding, lower is higher quality
                 and larger file size (default: 23). -maxrate/-bufsize still cap the peak
                 bitrate so the PSP's decoder buffer requirements are respected.
+            progress: Emit machine-readable progress on stdout (-progress pipe:1)
+                instead of the human-readable stats line.
 
         Returns:
             List of command arguments for ffmpeg
         """
         cmd = [
-            'ffmpeg',
-            '-hide_banner',
-            '-loglevel', 'error',
-            '-stats',
-            '-y',  
-            '-i', input_file
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            *(["-progress", "pipe:1", "-nostats"] if progress else ["-stats"]),
+            "-y",
+            "-i", input_file,
+            "-map", f"0:v:{video_index}",
+            "-map", f"0:a:{audio_index}",
+            "-vf", self._build_video_filter(input_file, subtitle_index, external_subs),
+            "-c:v", "libx264",
+            "-preset", preset,
+            "-profile:v", "baseline",
+            "-level:v", "3.0",
+            "-pix_fmt", "yuv420p",
+            "-crf", str(crf),
+            "-maxrate", "768k",
+            "-bufsize", "2000k",
+            "-r", "30000/1001",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ac", "2",
+            "-ar", "48000",
         ]
-        
-        cmd.extend(['-map', f'0:v:{video_index}'])
-        cmd.extend(['-map', f'0:a:{audio_index}'])
-
-        vf_filter = self._build_video_filter(input_file, subtitle_index, external_subs)
-
-        cmd.extend([
-            '-vf', vf_filter,
-            '-c:v', 'libx264',
-            '-preset', preset,
-            '-profile:v', 'baseline',
-            '-level:v', '3.0',
-            '-crf', str(crf),
-            '-maxrate', '768k',
-            '-bufsize', '2000k',
-            '-r', '29.97',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-ac', '2',
-            '-ar', '48000'
-        ])
 
         if volume_factor != 1.0:
-            cmd.extend(['-af', f'volume={volume_factor}'])
+            cmd.extend(["-af", f"volume={volume_factor}"])
 
-        cmd.extend([
-            '-movflags', '+faststart',
-            output_file
-        ])
-
+        cmd.extend(["-movflags", "+faststart", output_file])
         return cmd
 
     def _build_video_filter(
         self,
         input_file: str,
-        subtitle_index: Optional[int],
-        external_subs: Optional[str]
+        subtitle_index: int | None,
+        external_subs: str | None,
     ) -> str:
         """Build the -vf filter string, including subtitle burn-in if requested."""
-        vf_filter = (
-            "scale=480:272:force_original_aspect_ratio=decrease,"
-            "pad=480:272:(ow-iw)/2:(oh-ih)/2"
-        )
+        filters = [
+            # Normalize anamorphic sources (e.g. DVDs) to square pixels first
+            "scale=trunc(iw*sar/2)*2:ih",
+            "setsar=1",
+            f"scale={PSP_WIDTH}:{PSP_HEIGHT}:force_original_aspect_ratio=decrease:force_divisible_by=2",
+            f"pad={PSP_WIDTH}:{PSP_HEIGHT}:(ow-iw)/2:(oh-ih)/2",
+        ]
 
         if external_subs:
             if not Path(external_subs).exists():
                 raise VideoConverterError(f"External subtitle file not found: {external_subs}")
-            ext_sub_escaped = self._escape_filter_string(external_subs)
-            vf_filter += f",subtitles='{ext_sub_escaped}'"
+            filters.append(f"subtitles=filename={escape_filter_value(external_subs)}")
         elif subtitle_index is not None:
-            input_escaped = self._escape_filter_string(input_file)
-            vf_filter += f",subtitles='{input_escaped}:si={subtitle_index}'"
+            filters.append(
+                f"subtitles=filename={escape_filter_value(input_file)}:si={subtitle_index}"
+            )
 
-        return vf_filter
-    
-    def _escape_filter_string(self, path: str) -> str:
-        """Escape special characters for FFmpeg filter strings."""
-        return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-    
+        return ",".join(filters)
+
     def convert_video(
         self,
         input_file: str,
-        output_file: Optional[str] = None,
-        video_track: Optional[int] = None,
-        audio_track: Optional[int] = None,
-        subtitle_track: Optional[int] = None,
-        external_subs: Optional[str] = None,
+        output_file: str | None = None,
+        video_track: int | None = None,
+        audio_track: int | None = None,
+        subtitle_track: int | None = None,
+        external_subs: str | None = None,
         volume_factor: float = 1.0,
-        preset: str = "medium",
-        crf: int = 23
+        preset: str = DEFAULT_PRESET,
+        crf: int = DEFAULT_CRF,
     ) -> None:
         """
         Main conversion method.
@@ -327,74 +340,81 @@ class PSPVideoConverter:
         if not input_path.exists():
             raise VideoConverterError(f"Input file does not exist: {input_file}")
 
-        if not output_file:
-            output_file = str(input_path.with_suffix('.mp4'))
+        output_path = Path(output_file) if output_file else default_output_path(input_path)
+        if output_path.resolve() == input_path.resolve():
+            raise VideoConverterError("Output file must be different from the input file.")
 
-        if Path(output_file).exists():
-            answer = input(f"Output file '{output_file}' already exists. Overwrite? [y/N]: ").strip().lower()
-            if answer not in ('y', 'yes'):
+        if output_path.exists():
+            answer = input(f"Output file '{output_path}' already exists. Overwrite? [y/N]: ").strip().lower()
+            if answer not in ("y", "yes"):
                 raise VideoConverterError("Conversion cancelled: output file already exists.")
 
         print("Analyzing input file...")
-        streams = self.ffprobe_streams(input_file)
-        video_tracks, audio_tracks, subtitle_tracks = self.get_tracks_by_type(streams)
-        
-        if not video_tracks:
+        info = self.probe(input_file)
+
+        if not info.video:
             raise VideoConverterError("No video tracks found in the input file.")
-        if not audio_tracks:
+        if not info.audio:
             raise VideoConverterError("No audio tracks found in the input file.")
-        
-        video_index = self._select_track(video_tracks, video_track, "video")
-        audio_index = self._select_track(audio_tracks, audio_track, "audio")
+
+        video_index = self._select_track(info.video, video_track, "video")
+        audio_index = self._select_track(info.audio, audio_track, "audio")
 
         subtitle_index = None
         if external_subs:
             print(f"Using external subtitles: {external_subs}")
-        elif subtitle_tracks:
-            if subtitle_track is not None:
-                if 0 <= subtitle_track < len(subtitle_tracks):
-                    subtitle_index = subtitle_track
-                else:
-                    print(f"Warning: Invalid subtitle index {subtitle_track}. No subtitles will be used.")
+        elif info.subtitle:
+            if subtitle_track is None:
+                subtitle_index = self.choose_track_interactively(info.subtitle, "subtitle")
+            elif not 0 <= subtitle_track < len(info.subtitle):
+                print(f"Warning: Invalid subtitle index {subtitle_track}. No subtitles will be used.")
+            elif info.subtitle[subtitle_track].is_image_subtitle:
+                raise VideoConverterError(
+                    f"Subtitle track {subtitle_track} is image-based "
+                    f"({info.subtitle[subtitle_track].codec_name}) and can't be burned. "
+                    "Convert it to SRT and use --external-subs."
+                )
             else:
-                subtitle_index = self.choose_track_interactively(subtitle_tracks, "subtitle")
-        
-        # Show volume factor if different from default
+                subtitle_index = subtitle_track
+
         if volume_factor != 1.0:
             print(f"Audio volume will be adjusted by factor: {volume_factor}")
-        
+
         cmd = self.build_ffmpeg_command(
             input_file=input_file,
-            output_file=output_file,
+            output_file=str(output_path),
             video_index=video_index,
             audio_index=audio_index,
             subtitle_index=subtitle_index,
             external_subs=external_subs,
             volume_factor=volume_factor,
             preset=preset,
-            crf=crf
+            crf=crf,
         )
 
         print("\nStarting conversion...")
-        print(f"Output: {output_file}")
-        
+        print(f"Output: {output_path}")
+
         try:
             subprocess.run(cmd, check=True)
-            print(f"\n✓ Conversion completed successfully!")
-            print(f"Output file: {output_file}")
+        except FileNotFoundError:
+            raise VideoConverterError(
+                "ffmpeg not found. Please install FFmpeg and ensure it's in your PATH."
+            )
         except subprocess.CalledProcessError as e:
             raise VideoConverterError(f"FFmpeg conversion failed with exit code {e.returncode}")
-    
-    def _select_track(self, tracks: List[Dict], specified_index: Optional[int], track_type: str) -> int:
+        print("\n✓ Conversion completed successfully!")
+        print(f"Output file: {output_path}")
+
+    def _select_track(self, tracks: list[Track], specified_index: int | None, track_type: str) -> int:
         """Select a track either from user specification or interactive choice."""
         if specified_index is not None:
             if 0 <= specified_index < len(tracks):
                 return specified_index
-            else:
-                raise VideoConverterError(
-                    f"Invalid {track_type} track index {specified_index}. "
-                    f"Available range: 0-{len(tracks)-1}"
-                )
+            raise VideoConverterError(
+                f"Invalid {track_type} track index {specified_index}. "
+                f"Available range: 0-{len(tracks) - 1}"
+            )
 
         selected = self.choose_track_interactively(tracks, track_type)
         if selected is None:
@@ -409,13 +429,8 @@ def print_title() -> None:
     print("+" + "-" * 50 + "+")
     print("                                     by Erick Ghuron", end="\n\n")
 
-def main() -> None:
-    """Main entry point."""
-    if any(arg in ("--gui", "-g") for arg in sys.argv[1:]):
-        from video2psp.gui import launch_gui
-        launch_gui()
-        return
 
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert video files to PSP-compatible MP4 format with user-selected tracks.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -433,12 +448,18 @@ Examples:
     )
 
     parser.add_argument(
+        "-g", "--gui",
+        action="store_true",
+        help="Open the graphical interface"
+    )
+    parser.add_argument(
         "input_file",
+        nargs="?",
         help="Input video file path"
     )
     parser.add_argument(
         "output_file",
-        nargs='?',
+        nargs="?",
         help="Output file path (default: input filename with .mp4 extension)"
     )
     parser.add_argument(
@@ -468,34 +489,40 @@ Examples:
     )
     parser.add_argument(
         "--preset",
-        choices=[
-            "ultrafast", "superfast", "veryfast", "faster",
-            "fast", "medium", "slow", "slower", "veryslow"
-        ],
-        default="medium",
+        choices=PRESETS,
+        default=DEFAULT_PRESET,
         help="libx264 encoding preset, trades encoding speed for compression efficiency (default: medium)"
     )
     parser.add_argument(
         "--crf",
         type=int,
-        default=23,
+        default=DEFAULT_CRF,
         help="Constant Rate Factor (0-51): lower means higher quality and larger file size, "
              "higher means smaller file and lower quality (default: 23)"
     )
+    return parser
+
+
+def main() -> None:
+    """Main entry point."""
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.gui:
+        from video2psp.gui import launch_gui
+        launch_gui()
+        return
+
+    if not args.input_file:
+        parser.error("the following arguments are required: input_file")
+    if args.volume <= 0:
+        parser.error("--volume must be greater than 0")
+    if not 0 <= args.crf <= 51:
+        parser.error("--crf must be between 0 and 51")
 
     print_title()
 
     try:
-        args = parser.parse_args()
-
-        # Validate volume factor
-        if args.volume <= 0:
-            raise VideoConverterError("Volume factor must be greater than 0")
-
-        # Validate CRF range
-        if not 0 <= args.crf <= 51:
-            raise VideoConverterError("CRF must be between 0 and 51")
-
         converter = PSPVideoConverter()
         converter.convert_video(
             input_file=args.input_file,
@@ -508,7 +535,7 @@ Examples:
             preset=args.preset,
             crf=args.crf
         )
-        
+
     except VideoConverterError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

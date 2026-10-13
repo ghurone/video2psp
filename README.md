@@ -63,5 +63,7 @@ video2psp <input_video> <output_video> [options]
 - Resolution is scaled to fit within **480x272** (PSP screen size), preserving aspect ratio and padding with black bars as needed.  
 - Only **one** video and audio track is included, and **one** subtitle track can be burned.  
 - For image-based subtitles (like PGS or VobSub), you need to convert them to a text format (e.g., SRT) before burning.
+- If no output file is given and the input is already an `.mp4`, the output is saved as `<name>_psp.mp4` so the original is never overwritten.
+- 10-bit sources and anamorphic videos (e.g. DVDs) are converted to 8-bit and square pixels automatically.
 
 Feel free to contribute or customize further. Enjoy converting videos for your PSP!

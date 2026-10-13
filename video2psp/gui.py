@@ -2,7 +2,6 @@
 video2psp GUI - a Tkinter wrapper around PSPVideoConverter.
 """
 
-import json
 import os
 import queue
 import subprocess
@@ -11,9 +10,17 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional
 
-from video2psp.psp import PSPVideoConverter, VideoConverterError
+from video2psp.psp import (
+    DEFAULT_CRF,
+    DEFAULT_PRESET,
+    PRESETS,
+    MediaInfo,
+    PSPVideoConverter,
+    Track,
+    VideoConverterError,
+    default_output_path,
+)
 
 VIDEO_FILETYPES = [
     ("Video files", "*.mp4 *.mkv *.avi *.mov *.webm *.flv *.wmv *.m4v *.ts"),
@@ -23,11 +30,6 @@ SUBTITLE_FILETYPES = [
     ("Subtitles", "*.srt *.ass *.ssa *.vtt"),
     ("All files", "*.*"),
 ]
-PRESETS = [
-    "ultrafast", "superfast", "veryfast", "faster",
-    "fast", "medium", "slow", "slower", "veryslow",
-]
-
 LABEL_PADY = 10
 LABEL_PADX = (0, 16)
 
@@ -101,32 +103,6 @@ def _apply_style(root: tk.Tk) -> None:
     )
 
 
-def _format_track_label(track: Dict, track_type: str) -> str:
-    idx = track["index_in_type"]
-    label = f"[{idx}] {track['codec_name']}"
-    if track.get("language") and track["language"] != "und":
-        label += f", {track['language']}"
-    if track.get("title"):
-        label += f', "{track["title"]}"'
-    if track_type == "video":
-        label += f", {track['width']}x{track['height']}, {track['fps']}fps"
-    elif track_type == "audio":
-        label += f", {track['channels']}ch, {track['sample_rate']}Hz"
-    return label
-
-
-def _probe_duration_seconds(input_file: str) -> float:
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries", "format=duration", input_file],
-            capture_output=True, text=True, check=True, timeout=30,
-        )
-        data = json.loads(result.stdout)
-        return float(data.get("format", {}).get("duration") or 0.0)
-    except Exception:
-        return 0.0
-
-
 def _parse_out_time(value: str) -> float:
     try:
         h, m, s = value.split(":")
@@ -135,16 +111,31 @@ def _parse_out_time(value: str) -> float:
         return 0.0
 
 
+# Windows/macOS report wheel motion via <MouseWheel>; X11 (Linux) uses buttons 4/5.
+WHEEL_EVENTS = ("<MouseWheel>", "<Button-4>", "<Button-5>")
+
+
+def _wheel_units(event: tk.Event) -> int:
+    if event.num == 4:
+        return -1
+    if event.num == 5:
+        return 1
+    if sys.platform == "darwin":
+        return -event.delta
+    return int(-event.delta / 120)
+
+
 class PSPConverterGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.converter = PSPVideoConverter()
 
-        self.video_tracks: List[Dict] = []
-        self.audio_tracks: List[Dict] = []
-        self.subtitle_tracks: List[Dict] = []
+        self.video_tracks: list[Track] = []
+        self.audio_tracks: list[Track] = []
+        self.subtitle_tracks: list[Track] = []
+        self.duration = 0.0
 
-        self.proc: Optional[subprocess.Popen] = None
+        self.proc: subprocess.Popen | None = None
         self._cancel_requested = False
         self.output_user_edited = False
         self._analysis_token = 0
@@ -154,8 +145,8 @@ class PSPConverterGUI:
         self.output_var = tk.StringVar()
         self.external_subs_var = tk.StringVar()
         self.volume_var = tk.DoubleVar(value=1.0)
-        self.preset_var = tk.StringVar(value="medium")
-        self.crf_var = tk.DoubleVar(value=23.0)
+        self.preset_var = tk.StringVar(value=DEFAULT_PRESET)
+        self.crf_var = tk.DoubleVar(value=float(DEFAULT_CRF))
         self.status_var = tk.StringVar(value="Select a video to get started.")
 
         _apply_style(root)
@@ -200,9 +191,10 @@ class PSPConverterGUI:
         canvas.bind("<Configure>", _on_canvas_configure)
 
         def _on_mousewheel(event) -> None:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            canvas.yview_scroll(_wheel_units(event), "units")
 
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        for sequence in WHEEL_EVENTS:
+            canvas.bind_all(sequence, _on_mousewheel)
         self._canvas = canvas
 
         header = ttk.Frame(scroll_frame, style="TFrame", padding=(20, 20, 20, 10))
@@ -267,7 +259,7 @@ class PSPConverterGUI:
             variable=self.crf_var, command=self._on_crf_change
         )
         self.crf_scale.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.crf_value_label = ttk.Label(crf_frame, text="23", style="Card.TLabel", width=3)
+        self.crf_value_label = ttk.Label(crf_frame, text=str(DEFAULT_CRF), style="Card.TLabel", width=3)
         self.crf_value_label.pack(side="right")
 
         progress_card = self._card(body, "Progress")
@@ -292,14 +284,15 @@ class PSPConverterGUI:
         canvas = self._canvas
 
         def _scroll_and_break(event) -> str:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            canvas.yview_scroll(_wheel_units(event), "units")
             return "break"
 
         for widget in (
             self.video_combo, self.audio_combo, self.subtitle_combo,
             self.preset_combo, self.volume_spin, self.crf_scale,
         ):
-            widget.bind("<MouseWheel>", _scroll_and_break)
+            for sequence in WHEEL_EVENTS:
+                widget.bind(sequence, _scroll_and_break)
 
     def _card(self, parent: tk.Widget, title: str) -> ttk.Frame:
         outer = ttk.Frame(parent, style="TFrame", padding=(20, 0, 20, 14))
@@ -330,7 +323,7 @@ class PSPConverterGUI:
             return
         self.input_var.set(path)
         if not self.output_user_edited:
-            self.output_var.set(str(Path(path).with_suffix(".mp4")))
+            self.output_var.set(str(default_output_path(path)))
         self._reset_tracks()
         self._set_status("Analyzing file...")
 
@@ -378,6 +371,7 @@ class PSPConverterGUI:
         self.video_tracks = []
         self.audio_tracks = []
         self.subtitle_tracks = []
+        self.duration = 0.0
         for combo in (self.video_combo, self.audio_combo, self.subtitle_combo):
             combo.configure(state="disabled", values=[])
             combo.set("")
@@ -385,31 +379,31 @@ class PSPConverterGUI:
 
     def _analyze_worker(self, input_file: str, token: int) -> None:
         try:
-            streams = self.converter.ffprobe_streams(input_file)
-            video_tracks, audio_tracks, subtitle_tracks = self.converter.get_tracks_by_type(streams)
-            if not video_tracks:
+            info = self.converter.probe(input_file)
+            if not info.video:
                 raise VideoConverterError("No video track found in the file.")
-            if not audio_tracks:
+            if not info.audio:
                 raise VideoConverterError("No audio track found in the file.")
-            self.msg_queue.put(("analyzed", (token, video_tracks, audio_tracks, subtitle_tracks)))
+            self.msg_queue.put(("analyzed", (token, info)))
         except VideoConverterError as e:
             self.msg_queue.put(("analyze_error", (token, str(e))))
         except Exception as e:
             self.msg_queue.put(("analyze_error", (token, f"Unexpected error: {e}")))
 
-    def _populate_tracks(self, video_tracks: List[Dict], audio_tracks: List[Dict], subtitle_tracks: List[Dict]) -> None:
-        self.video_tracks = video_tracks
-        self.audio_tracks = audio_tracks
-        self.subtitle_tracks = subtitle_tracks
+    def _populate_tracks(self, info: MediaInfo) -> None:
+        self.video_tracks = info.video
+        self.audio_tracks = info.audio
+        self.subtitle_tracks = info.subtitle
+        self.duration = info.duration
 
-        self.video_combo.configure(state="readonly", values=[_format_track_label(t, "video") for t in video_tracks])
+        self.video_combo.configure(state="readonly", values=[t.label() for t in info.video])
         self.video_combo.current(0)
 
-        self.audio_combo.configure(state="readonly", values=[_format_track_label(t, "audio") for t in audio_tracks])
+        self.audio_combo.configure(state="readonly", values=[t.label() for t in info.audio])
         self.audio_combo.current(0)
 
-        if subtitle_tracks:
-            values = ["None"] + [_format_track_label(t, "subtitle") for t in subtitle_tracks]
+        if info.subtitle:
+            values = ["None"] + [t.label() for t in info.subtitle]
             self.subtitle_combo.configure(state="readonly", values=values)
             self.subtitle_combo.current(0)
         else:
@@ -433,6 +427,9 @@ class PSPConverterGUI:
         if not output_file:
             messagebox.showerror("Error", "Enter an output file.")
             return
+        if Path(output_file).resolve() == Path(input_file).resolve():
+            messagebox.showerror("Error", "The output file must be different from the input file.")
+            return
         if Path(output_file).exists():
             if not messagebox.askyesno("Overwrite?", f"'{Path(output_file).name}' already exists. Overwrite?"):
                 return
@@ -449,10 +446,17 @@ class PSPConverterGUI:
         video_index = self.video_combo.current()
         audio_index = self.audio_combo.current()
 
-        subtitle_index: Optional[int] = None
+        subtitle_index: int | None = None
         external_subs = self.external_subs_var.get().strip() or None
         if not external_subs and self.subtitle_tracks and self.subtitle_combo.current() > 0:
             subtitle_index = self.subtitle_combo.current() - 1
+            if self.subtitle_tracks[subtitle_index].is_image_subtitle:
+                messagebox.showerror(
+                    "Error",
+                    "Image-based subtitles (PGS/VobSub) can't be burned.\n"
+                    "Convert them to SRT and use the external subtitle field.",
+                )
+                return
 
         try:
             cmd = self.converter.build_ffmpeg_command(
@@ -465,28 +469,24 @@ class PSPConverterGUI:
                 volume_factor=volume,
                 preset=self.preset_var.get(),
                 crf=crf,
+                progress=True,
             )
         except VideoConverterError as e:
             messagebox.showerror("Error", str(e))
             return
 
-        output_arg = cmd[-1]
-        cmd = cmd[:-1] + ["-progress", "pipe:1", "-nostats"] + [output_arg]
-
         self._cancel_requested = False
         self._set_converting(True)
         self._log(f"Starting conversion: {Path(input_file).name} -> {Path(output_file).name}")
-        self.progress.configure(mode="indeterminate")
-        self.progress.start(12)
+        if self.duration > 0:
+            self.progress.configure(mode="determinate", value=0)
+        else:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
 
-        threading.Thread(target=self._probe_and_convert, args=(input_file, cmd), daemon=True).start()
+        threading.Thread(target=self._run_ffmpeg, args=(cmd, self.duration), daemon=True).start()
 
-    def _probe_and_convert(self, input_file: str, cmd: List[str]) -> None:
-        duration = _probe_duration_seconds(input_file)
-        self.msg_queue.put(("duration", duration))
-        self._run_ffmpeg(cmd, duration)
-
-    def _run_ffmpeg(self, cmd: List[str], duration: float) -> None:
+    def _run_ffmpeg(self, cmd: list[str], duration: float) -> None:
         try:
             self.proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
@@ -495,7 +495,7 @@ class PSPConverterGUI:
             self.msg_queue.put(("convert_error", "ffmpeg not found. Make sure it's installed and in your PATH."))
             return
 
-        stderr_lines: List[str] = []
+        stderr_lines: list[str] = []
 
         def _drain_stderr() -> None:
             if self.proc is None or self.proc.stderr is None:
@@ -555,22 +555,18 @@ class PSPConverterGUI:
                 kind, payload = self.msg_queue.get_nowait()
 
                 if kind == "analyzed":
-                    token, video_tracks, audio_tracks, subtitle_tracks = payload
+                    token, info = payload
                     if token == self._analysis_token:
-                        self._populate_tracks(video_tracks, audio_tracks, subtitle_tracks)
+                        self._populate_tracks(info)
                         self._set_status(
-                            f"Found {len(video_tracks)} video track(s), {len(audio_tracks)} audio track(s), "
-                            f"{len(subtitle_tracks)} subtitle track(s)."
+                            f"Found {len(info.video)} video track(s), {len(info.audio)} audio track(s), "
+                            f"{len(info.subtitle)} subtitle track(s)."
                         )
                 elif kind == "analyze_error":
                     token, message = payload
                     if token == self._analysis_token:
                         messagebox.showerror("Error analyzing file", message)
                         self._set_status("Failed to analyze the file.")
-                elif kind == "duration":
-                    if payload and payload > 0:
-                        self.progress.stop()
-                        self.progress.configure(mode="determinate", value=0)
                 elif kind == "progress":
                     if payload is not None:
                         self.progress.configure(value=payload)
