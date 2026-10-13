@@ -1,3 +1,4 @@
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,9 @@ from video2psp.psp import (
     build_parser,
     default_output_path,
     escape_filter_value,
+    format_frame_rate,
+    output_frame_rate,
+    parse_frame_rate,
     parse_streams,
 )
 
@@ -101,3 +105,56 @@ def test_build_command_missing_external_subs():
 def test_parser_gui_without_input():
     args = build_parser().parse_args(["--gui"])
     assert args.gui and args.input_file is None
+
+
+NTSC_FILM = Fraction(24000, 1001)
+NTSC = Fraction(30000, 1001)
+
+
+@pytest.mark.parametrize("source, expected", [
+    (NTSC_FILM, NTSC_FILM),                # film stays film
+    (Fraction(25), Fraction(25)),          # PAL stays PAL
+    (NTSC, NTSC),
+    (Fraction(60000, 1001), NTSC),         # 59.94 -> 29.97
+    (Fraction(50), Fraction(25)),          # 50 -> 25, not 29.97
+    (Fraction(60), NTSC),                  # 60 -> 30 -> capped to 29.97
+    (Fraction(30), NTSC),
+    (None, NTSC),                          # unknown source rate
+])
+def test_output_frame_rate_from_source(source, expected):
+    assert output_frame_rate(source) == expected
+
+
+def test_output_frame_rate_user_choice_wins():
+    assert output_frame_rate(Fraction(60), Fraction(25)) == 25
+    assert output_frame_rate(NTSC_FILM, Fraction(30)) == NTSC
+
+
+def test_parse_and_format_frame_rate():
+    assert parse_frame_rate("23.976") == NTSC_FILM
+    assert parse_frame_rate("24000/1001") == NTSC_FILM
+    assert parse_frame_rate(" 25 ") == 25
+    assert format_frame_rate(NTSC_FILM) == "23.976"
+    assert format_frame_rate(NTSC) == "29.97"
+    assert format_frame_rate(Fraction(25)) == "25"
+    for bad in ("abc", "0", "-5", "1/0"):
+        with pytest.raises(ValueError):
+            parse_frame_rate(bad)
+
+
+def test_build_command_frame_rate_and_hwaccel():
+    converter = PSPVideoConverter()
+    cmd = converter.build_ffmpeg_command("in.mkv", "out.mp4", 0, 0, frame_rate=NTSC_FILM)
+    assert cmd[cmd.index("-r") + 1] == "24000/1001"
+    assert cmd[cmd.index("-hwaccel") + 1] == "auto"
+    assert cmd.index("-hwaccel") < cmd.index("-i")
+
+    cmd = converter.build_ffmpeg_command("in.mkv", "out.mp4", 0, 0, hwaccel=False)
+    assert "-hwaccel" not in cmd
+
+
+def test_parser_fps_and_hwaccel_defaults():
+    args = build_parser().parse_args(["in.mkv"])
+    assert args.fps == "source" and args.hwaccel is True
+    args = build_parser().parse_args(["in.mkv", "--fps", "25", "--no-hwaccel"])
+    assert args.fps == "25" and args.hwaccel is False

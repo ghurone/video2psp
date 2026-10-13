@@ -25,7 +25,7 @@ Prefer a graphical interface? Run:
 ```bash
 video2psp --gui
 ```
-(`-g` also works). This opens a window where you can pick the input/output files, choose tracks, and tweak volume/preset/CRF without touching the terminal.
+(`-g` also works). This opens a window where you can pick the input/output files, choose tracks, and tweak volume/preset/CRF/frame rate without touching the terminal.
 
 ### CLI
 
@@ -56,6 +56,14 @@ video2psp <input_video> <output_video> [options]
   video2psp movie.mkv out.mp4 --crf 26
   ```
   Video is encoded at a constant quality target rather than a fixed bitrate, so simple scenes take up less space; `-maxrate`/`-bufsize` still cap the peak bitrate to respect the PSP's decoder buffer limits.
+- The output keeps the source frame rate by default (max 29.97 fps, the PSP limit; higher rates are divided evenly, e.g. 59.94 → 29.97, 50 → 25). To pick one yourself:
+  ```bash
+  video2psp movie.mkv out.mp4 --fps 23.976
+  ```
+- Hardware (GPU) decoding is on by default and falls back to the CPU automatically when unavailable. If it causes problems on your machine, turn it off:
+  ```bash
+  video2psp movie.mkv out.mp4 --no-hwaccel
+  ```
   
 ## Notes & Limitations
 

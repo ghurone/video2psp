@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from fractions import Fraction
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -20,6 +21,9 @@ from video2psp.psp import (
     Track,
     VideoConverterError,
     default_output_path,
+    format_frame_rate,
+    output_frame_rate,
+    parse_frame_rate,
 )
 
 VIDEO_FILETYPES = [
@@ -30,6 +34,9 @@ SUBTITLE_FILETYPES = [
     ("Subtitles", "*.srt *.ass *.ssa *.vtt"),
     ("All files", "*.*"),
 ]
+FPS_SOURCE = "Source"
+FPS_CHOICES = [FPS_SOURCE, "23.976", "24", "25", "29.97"]
+
 LABEL_PADY = 10
 LABEL_PADX = (0, 16)
 
@@ -66,6 +73,9 @@ def _apply_style(root: tk.Tk) -> None:
     style.configure("Header.TLabel", background=COLORS["bg"], foreground=COLORS["text"], font=title_font)
     style.configure("SubHeader.TLabel", background=COLORS["bg"], foreground=COLORS["muted"], font=default_font)
     style.configure("CardTitle.TLabel", background=COLORS["card"], foreground=COLORS["text"], font=bold_font)
+
+    style.configure("Card.TCheckbutton", background=COLORS["card"], foreground=COLORS["text"])
+    style.map("Card.TCheckbutton", background=[("active", COLORS["card"])])
 
     style.configure("TEntry", fieldbackground="#ffffff", padding=6)
     style.configure("TCombobox", fieldbackground="#ffffff", padding=6)
@@ -147,6 +157,8 @@ class PSPConverterGUI:
         self.volume_var = tk.DoubleVar(value=1.0)
         self.preset_var = tk.StringVar(value=DEFAULT_PRESET)
         self.crf_var = tk.DoubleVar(value=float(DEFAULT_CRF))
+        self.fps_var = tk.StringVar(value=FPS_SOURCE)
+        self.hwaccel_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Select a video to get started.")
 
         _apply_style(root)
@@ -262,6 +274,21 @@ class PSPConverterGUI:
         self.crf_value_label = ttk.Label(crf_frame, text=str(DEFAULT_CRF), style="Card.TLabel", width=3)
         self.crf_value_label.pack(side="right")
 
+        ttk.Label(settings, text="Frame rate", style="Card.TLabel").grid(row=4, column=0, sticky="w", pady=LABEL_PADY, padx=LABEL_PADX)
+        self.fps_combo = ttk.Combobox(
+            settings, state="readonly", values=FPS_CHOICES, textvariable=self.fps_var, width=12
+        )
+        self.fps_combo.grid(row=4, column=1, sticky="w", pady=LABEL_PADY)
+        self.fps_hint = ttk.Label(settings, text="keeps the video's rate (max 29.97)", style="Muted.TLabel")
+        self.fps_hint.grid(row=4, column=2, sticky="w", padx=(16, 0))
+        self.fps_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_fps_hint())
+        self.video_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_fps_hint())
+
+        ttk.Checkbutton(
+            settings, text="Hardware decoding (faster, falls back to CPU automatically)",
+            variable=self.hwaccel_var, style="Card.TCheckbutton",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=LABEL_PADY)
+
         progress_card = self._card(body, "Progress")
         progress_card.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(progress_card, orient="horizontal", mode="determinate", maximum=100)
@@ -289,7 +316,7 @@ class PSPConverterGUI:
 
         for widget in (
             self.video_combo, self.audio_combo, self.subtitle_combo,
-            self.preset_combo, self.volume_spin, self.crf_scale,
+            self.preset_combo, self.volume_spin, self.crf_scale, self.fps_combo,
         ):
             for sequence in WHEEL_EVENTS:
                 widget.bind(sequence, _scroll_and_break)
@@ -316,6 +343,19 @@ class PSPConverterGUI:
     def _on_crf_change(self, value: str) -> None:
         rounded = int(round(float(value)))
         self.crf_value_label.configure(text=str(rounded))
+
+    def _selected_frame_rate(self) -> Fraction:
+        choice = self.fps_var.get()
+        requested = None if choice == FPS_SOURCE else parse_frame_rate(choice)
+        video_index = self.video_combo.current()
+        source = self.video_tracks[video_index].frame_rate if self.video_tracks and video_index >= 0 else None
+        return output_frame_rate(source, requested)
+
+    def _update_fps_hint(self) -> None:
+        if not self.video_tracks:
+            self.fps_hint.configure(text="keeps the video's rate (max 29.97)")
+            return
+        self.fps_hint.configure(text=f"output: {format_frame_rate(self._selected_frame_rate())} fps")
 
     def _browse_input(self) -> None:
         path = filedialog.askopenfilename(title="Select video", filetypes=VIDEO_FILETYPES)
@@ -375,6 +415,7 @@ class PSPConverterGUI:
         for combo in (self.video_combo, self.audio_combo, self.subtitle_combo):
             combo.configure(state="disabled", values=[])
             combo.set("")
+        self._update_fps_hint()
         self.convert_btn.configure(state="disabled")
 
     def _analyze_worker(self, input_file: str, token: int) -> None:
@@ -410,6 +451,7 @@ class PSPConverterGUI:
             self.subtitle_combo.configure(state="disabled", values=["No subtitles available"])
             self.subtitle_combo.current(0)
 
+        self._update_fps_hint()
         self.convert_btn.configure(state="normal")
 
     # -- Conversion ------------------------------------------------------
@@ -469,6 +511,8 @@ class PSPConverterGUI:
                 volume_factor=volume,
                 preset=self.preset_var.get(),
                 crf=crf,
+                frame_rate=self._selected_frame_rate(),
+                hwaccel=self.hwaccel_var.get(),
                 progress=True,
             )
         except VideoConverterError as e:

@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 
 PRESETS = [
@@ -19,6 +20,14 @@ DEFAULT_CRF = 23
 
 PSP_WIDTH = 480
 PSP_HEIGHT = 272
+PSP_MAX_FPS = Fraction(30000, 1001)
+
+# Common NTSC rates people type as decimals, mapped to their exact values.
+FPS_ALIASES = {
+    "23.976": Fraction(24000, 1001),
+    "23.98": Fraction(24000, 1001),
+    "29.97": Fraction(30000, 1001),
+}
 
 # Bitmap subtitle codecs can't be rendered by the `subtitles` (libass) filter.
 IMAGE_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
@@ -38,9 +47,13 @@ class Track:
     title: str = ""
     width: int = 0
     height: int = 0
-    fps: str = "unknown"
+    frame_rate: Fraction | None = None
     channels: int = 0
     sample_rate: str = "unknown"
+
+    @property
+    def fps(self) -> str:
+        return f"{float(self.frame_rate):.2f}" if self.frame_rate else "unknown"
 
     @property
     def is_image_subtitle(self) -> bool:
@@ -71,12 +84,41 @@ class MediaInfo:
     duration: float = 0.0
 
 
-def _parse_fps(rate: str) -> str:
+def _parse_rate(rate: str | None) -> Fraction | None:
     try:
-        num, den = map(int, rate.split("/"))
-        return f"{num / den:.2f}"
-    except (ValueError, ZeroDivisionError):
-        return "unknown"
+        value = Fraction(rate)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return value if value > 0 else None
+
+
+def parse_frame_rate(value: str) -> Fraction:
+    """Parse a user-supplied frame rate such as '25', '23.976' or '24000/1001'."""
+    value = value.strip()
+    rate = FPS_ALIASES.get(value) or _parse_rate(value)
+    if rate is None:
+        raise ValueError(f"invalid frame rate: {value!r}")
+    return rate
+
+
+def format_frame_rate(rate: Fraction) -> str:
+    return f"{float(rate):.3f}".rstrip("0").rstrip(".")
+
+
+def output_frame_rate(source: Fraction | None, requested: Fraction | None = None) -> Fraction:
+    """
+    Frame rate to encode at. An explicit request wins; otherwise the source
+    rate is kept, divided by the smallest integer that brings it within the
+    PSP limit (59.94 -> 29.97, 50 -> 25) so frames are dropped evenly.
+    """
+    if requested is not None:
+        return min(requested, PSP_MAX_FPS)
+    if source is None:
+        return PSP_MAX_FPS
+    divisor = 1
+    while source / divisor > 30:
+        divisor += 1
+    return min(source / divisor, PSP_MAX_FPS)
 
 
 def parse_streams(data: dict) -> MediaInfo:
@@ -97,7 +139,10 @@ def parse_streams(data: dict) -> MediaInfo:
             title=tags.get("title", ""),
             width=stream.get("width", 0),
             height=stream.get("height", 0),
-            fps=_parse_fps(stream.get("r_frame_rate", "0/0")),
+            frame_rate=(
+                _parse_rate(stream.get("r_frame_rate"))
+                or _parse_rate(stream.get("avg_frame_rate"))
+            ),
             channels=stream.get("channels", 0),
             sample_rate=stream.get("sample_rate", "unknown"),
         ))
@@ -230,6 +275,8 @@ class PSPVideoConverter:
         volume_factor: float = 1.0,
         preset: str = DEFAULT_PRESET,
         crf: int = DEFAULT_CRF,
+        frame_rate: Fraction = PSP_MAX_FPS,
+        hwaccel: bool = True,
         progress: bool = False,
     ) -> list[str]:
         """
@@ -247,6 +294,9 @@ class PSPVideoConverter:
             crf: Constant Rate Factor for quality-based encoding, lower is higher quality
                 and larger file size (default: 23). -maxrate/-bufsize still cap the peak
                 bitrate so the PSP's decoder buffer requirements are respected.
+            frame_rate: Output frame rate (see output_frame_rate)
+            hwaccel: Let ffmpeg decode on the GPU when possible; it falls back
+                to software decoding on its own when no hardware decoder fits.
             progress: Emit machine-readable progress on stdout (-progress pipe:1)
                 instead of the human-readable stats line.
 
@@ -259,6 +309,7 @@ class PSPVideoConverter:
             "-loglevel", "error",
             *(["-progress", "pipe:1", "-nostats"] if progress else ["-stats"]),
             "-y",
+            *(["-hwaccel", "auto"] if hwaccel else []),
             "-i", input_file,
             "-map", f"0:v:{video_index}",
             "-map", f"0:a:{audio_index}",
@@ -271,7 +322,7 @@ class PSPVideoConverter:
             "-crf", str(crf),
             "-maxrate", "768k",
             "-bufsize", "2000k",
-            "-r", "30000/1001",
+            "-r", f"{frame_rate.numerator}/{frame_rate.denominator}",
             "-c:a", "aac",
             "-b:a", "128k",
             "-ac", "2",
@@ -321,6 +372,8 @@ class PSPVideoConverter:
         volume_factor: float = 1.0,
         preset: str = DEFAULT_PRESET,
         crf: int = DEFAULT_CRF,
+        fps: Fraction | None = None,
+        hwaccel: bool = True,
     ) -> None:
         """
         Main conversion method.
@@ -335,6 +388,8 @@ class PSPVideoConverter:
             volume_factor: Volume multiplication factor (default: 1.0)
             preset: libx264 encoding preset, trades speed for compression (default: medium)
             crf: Constant Rate Factor for quality-based encoding (default: 23)
+            fps: Output frame rate (default: keep the source rate, capped at 29.97)
+            hwaccel: Use hardware decoding when available (default: True)
         """
         input_path = Path(input_file)
         if not input_path.exists():
@@ -359,6 +414,8 @@ class PSPVideoConverter:
 
         video_index = self._select_track(info.video, video_track, "video")
         audio_index = self._select_track(info.audio, audio_track, "audio")
+        frame_rate = output_frame_rate(info.video[video_index].frame_rate, fps)
+        print(f"Output frame rate: {format_frame_rate(frame_rate)} fps")
 
         subtitle_index = None
         if external_subs:
@@ -390,6 +447,8 @@ class PSPVideoConverter:
             volume_factor=volume_factor,
             preset=preset,
             crf=crf,
+            frame_rate=frame_rate,
+            hwaccel=hwaccel,
         )
 
         print("\nStarting conversion...")
@@ -443,6 +502,8 @@ Examples:
   %(prog)s input.ext --volume 0.8 --audio-track 1
   %(prog)s input.ext --preset veryfast
   %(prog)s input.ext --crf 26
+  %(prog)s input.ext --fps 23.976
+  %(prog)s input.ext --no-hwaccel
   %(prog)s --gui
         """
     )
@@ -500,6 +561,18 @@ Examples:
         help="Constant Rate Factor (0-51): lower means higher quality and larger file size, "
              "higher means smaller file and lower quality (default: 23)"
     )
+    parser.add_argument(
+        "--fps",
+        default="source",
+        help="Output frame rate, e.g. 23.976, 25, 29.97 or 24000/1001 (max 29.97). "
+             "Default 'source' keeps the video's own rate, halving it if it is above 29.97"
+    )
+    parser.add_argument(
+        "--hwaccel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Decode the input on the GPU when available (default: on)"
+    )
     return parser
 
 
@@ -520,6 +593,15 @@ def main() -> None:
     if not 0 <= args.crf <= 51:
         parser.error("--crf must be between 0 and 51")
 
+    fps = None
+    if args.fps != "source":
+        try:
+            fps = parse_frame_rate(args.fps)
+        except ValueError:
+            parser.error(f"--fps must be 'source' or a number, got {args.fps!r}")
+        if fps > 30:
+            parser.error("--fps can't be above 29.97 (PSP limit)")
+
     print_title()
 
     try:
@@ -533,7 +615,9 @@ def main() -> None:
             external_subs=args.external_subs,
             volume_factor=args.volume,
             preset=args.preset,
-            crf=args.crf
+            crf=args.crf,
+            fps=fps,
+            hwaccel=args.hwaccel,
         )
 
     except VideoConverterError as e:
