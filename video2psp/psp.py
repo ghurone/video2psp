@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
+from video2psp import __version__
+
 PRESETS = [
     "ultrafast", "superfast", "veryfast", "faster",
     "fast", "medium", "slow", "slower", "veryslow",
@@ -508,6 +510,11 @@ Examples:
         """
     )
 
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}"
+    )
     parser.add_argument(
         "-g", "--gui",
         action="store_true",
