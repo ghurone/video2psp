@@ -5,6 +5,7 @@ Converts video files to PSP-compatible MP4 format with user-selected tracks.
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -36,6 +37,24 @@ IMAGE_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "x
 
 # Keeps ffprobe/ffmpeg from flashing a console window when launched from the GUI on Windows.
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def _tool_path(name: str) -> str:
+    """
+    Executable for ffmpeg/ffprobe. The standalone .exe build (PyInstaller)
+    ships its own copy in an `ffmpeg` folder; otherwise rely on the PATH.
+    """
+    if getattr(sys, "frozen", False):
+        bundle_dir = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        exe = f"{name}.exe" if sys.platform == "win32" else name
+        bundled = bundle_dir / "ffmpeg" / exe
+        if bundled.exists():
+            return str(bundled)
+    return name
+
+
+FFMPEG = _tool_path("ffmpeg")
+FFPROBE = _tool_path("ffprobe")
 
 
 class VideoConverterError(Exception):
@@ -108,6 +127,33 @@ def parse_frame_rate(value: str) -> Fraction:
 
 def format_frame_rate(rate: Fraction) -> str:
     return f"{float(rate):.3f}".rstrip("0").rstrip(".")
+
+
+def parse_timestamp(value: str) -> float:
+    """Parse a time such as '90', '1:30' or '01:02:03.5' into seconds."""
+    parts = value.strip().split(":")
+    try:
+        if len(parts) > 3:
+            raise ValueError
+        numbers = [float(p) for p in parts]
+    except ValueError:
+        raise ValueError(f"invalid time: {value!r}") from None
+    if not all(math.isfinite(n) and n >= 0 for n in numbers) or any(n >= 60 for n in numbers[1:]):
+        raise ValueError(f"invalid time: {value!r}")
+    seconds = 0.0
+    for n in numbers:
+        seconds = seconds * 60 + n
+    return seconds
+
+
+def format_timestamp(seconds: float) -> str:
+    """Seconds as HH:MM:SS, keeping a fraction only when there is one."""
+    whole = int(seconds)
+    text = f"{whole // 3600:02d}:{whole % 3600 // 60:02d}:{whole % 60:02d}"
+    fraction = round(seconds - whole, 3)
+    if fraction:
+        text += f"{fraction:.3f}".lstrip("0").rstrip("0")
+    return text
 
 
 def output_frame_rate(source: Fraction | None, requested: Fraction | None = None) -> Fraction:
@@ -184,6 +230,17 @@ def default_output_path(input_file: str | Path) -> Path:
     return output
 
 
+def check_trim(start: float | None, end: float | None, duration: float) -> None:
+    """Raise VideoConverterError if the trim range doesn't fit the video."""
+    if start and duration > 0 and start >= duration:
+        raise VideoConverterError(
+            f"Trim start ({format_timestamp(start)}) is past the end of the video "
+            f"({format_timestamp(round(duration))})."
+        )
+    if end is not None and end <= (start or 0):
+        raise VideoConverterError("Trim end must be after the start.")
+
+
 def remove_partial_output(path: str | Path) -> None:
     """Delete an unfinished output file so a broken video isn't left behind."""
     try:
@@ -206,7 +263,7 @@ class PSPVideoConverter:
             raise VideoConverterError(f"Input file does not exist: {input_file}")
 
         probe_cmd = [
-            "ffprobe",
+            FFPROBE,
             "-v", "quiet",
             "-print_format", "json",
             "-show_streams",
@@ -218,7 +275,8 @@ class PSPVideoConverter:
             # ffprobe writes UTF-8; the Windows default (cp1252) garbles or
             # fails on non-ASCII track titles.
             result = subprocess.run(
-                probe_cmd, capture_output=True, encoding="utf-8", errors="replace",
+                probe_cmd, capture_output=True, stdin=subprocess.DEVNULL,
+                encoding="utf-8", errors="replace",
                 check=True, timeout=30, creationflags=NO_WINDOW,
             )
             return parse_streams(json.loads(result.stdout))
@@ -294,6 +352,8 @@ class PSPVideoConverter:
         frame_rate: Fraction = PSP_MAX_FPS,
         hwaccel: bool = True,
         progress: bool = False,
+        start: float | None = None,
+        end: float | None = None,
     ) -> list[str]:
         """
         Generates an ffmpeg command for PSP conversion.
@@ -315,21 +375,26 @@ class PSPVideoConverter:
                 to software decoding on its own when no hardware decoder fits.
             progress: Emit machine-readable progress on stdout (-progress pipe:1)
                 instead of the human-readable stats line.
+            start: Trim: start the output at this many seconds into the input (optional)
+            end: Trim: stop the output at this many seconds into the input (optional)
 
         Returns:
             List of command arguments for ffmpeg
         """
         cmd = [
-            "ffmpeg",
+            FFMPEG,
             "-hide_banner",
             "-loglevel", "error",
             *(["-progress", "pipe:1", "-nostats"] if progress else ["-stats"]),
             "-y",
             *(["-hwaccel", "auto"] if hwaccel else []),
+            # Seeking on the input is fast, and still frame-accurate since we re-encode
+            *(["-ss", f"{start:.3f}"] if start else []),
             "-i", input_file,
+            *(["-t", f"{end - (start or 0):.3f}"] if end is not None else []),
             "-map", f"0:v:{video_index}",
             "-map", f"0:a:{audio_index}",
-            "-vf", self._build_video_filter(input_file, subtitle_index, external_subs),
+            "-vf", self._build_video_filter(input_file, subtitle_index, external_subs, start),
             "-c:v", "libx264",
             "-preset", preset,
             "-profile:v", "baseline",
@@ -356,6 +421,7 @@ class PSPVideoConverter:
         input_file: str,
         subtitle_index: int | None,
         external_subs: str | None,
+        start: float | None = None,
     ) -> str:
         """Build the -vf filter string, including subtitle burn-in if requested."""
         filters = [
@@ -366,14 +432,21 @@ class PSPVideoConverter:
             f"pad={PSP_WIDTH}:{PSP_HEIGHT}:(ow-iw)/2:(oh-ih)/2",
         ]
 
+        subtitles = None
         if external_subs:
             if not Path(external_subs).exists():
                 raise VideoConverterError(f"External subtitle file not found: {external_subs}")
-            filters.append(f"subtitles=filename={escape_filter_value(external_subs)}")
+            subtitles = f"subtitles=filename={escape_filter_value(external_subs)}"
         elif subtitle_index is not None:
-            filters.append(
-                f"subtitles=filename={escape_filter_value(input_file)}:si={subtitle_index}"
-            )
+            subtitles = f"subtitles=filename={escape_filter_value(input_file)}:si={subtitle_index}"
+
+        if subtitles and start:
+            # Input seeking restarts timestamps at 0, but the subtitle file is
+            # timed from the start of the video: shift frames back to their
+            # original time while rendering subtitles, then to 0 again.
+            filters += [f"setpts=PTS+{start:.3f}/TB", subtitles, "setpts=PTS-STARTPTS"]
+        elif subtitles:
+            filters.append(subtitles)
 
         return ",".join(filters)
 
@@ -390,6 +463,8 @@ class PSPVideoConverter:
         crf: int = DEFAULT_CRF,
         fps: Fraction | None = None,
         hwaccel: bool = True,
+        start: float | None = None,
+        end: float | None = None,
     ) -> None:
         """
         Main conversion method.
@@ -406,6 +481,8 @@ class PSPVideoConverter:
             crf: Constant Rate Factor for quality-based encoding (default: 23)
             fps: Output frame rate (default: keep the source rate, capped at 29.97)
             hwaccel: Use hardware decoding when available (default: True)
+            start: Trim start, in seconds (optional)
+            end: Trim end, in seconds (optional)
         """
         input_path = Path(input_file)
         if not input_path.exists():
@@ -427,6 +504,7 @@ class PSPVideoConverter:
             raise VideoConverterError("No video tracks found in the input file.")
         if not info.audio:
             raise VideoConverterError("No audio tracks found in the input file.")
+        check_trim(start, end, info.duration)
 
         video_index = self._select_track(info.video, video_track, "video")
         audio_index = self._select_track(info.audio, audio_track, "audio")
@@ -453,6 +531,11 @@ class PSPVideoConverter:
 
         if volume_factor != 1.0:
             print(f"Audio volume will be adjusted by factor: {volume_factor}")
+        if start or end is not None:
+            print(
+                f"Trim: {format_timestamp(start or 0)} -> "
+                f"{format_timestamp(end) if end is not None else 'end'}"
+            )
 
         cmd = self.build_ffmpeg_command(
             input_file=input_file,
@@ -466,6 +549,8 @@ class PSPVideoConverter:
             crf=crf,
             frame_rate=frame_rate,
             hwaccel=hwaccel,
+            start=start,
+            end=end,
         )
 
         print("\nStarting conversion...")
@@ -525,6 +610,7 @@ Examples:
   %(prog)s input.ext --crf 26
   %(prog)s input.ext --fps 23.976
   %(prog)s input.ext --no-hwaccel
+  %(prog)s input.ext --start 1:30 --end 22:10
   %(prog)s --gui
         """
     )
@@ -600,7 +686,26 @@ Examples:
         default=True,
         help="Decode the input on the GPU when available (default: on)"
     )
+    parser.add_argument(
+        "--start",
+        type=_timestamp_arg,
+        help="Trim: start the output at this time, e.g. 90, 1:30 or 00:01:30 (default: beginning)"
+    )
+    parser.add_argument(
+        "--end",
+        type=_timestamp_arg,
+        help="Trim: stop the output at this time, same format as --start (default: end of the video)"
+    )
     return parser
+
+
+def _timestamp_arg(value: str) -> float:
+    try:
+        return parse_timestamp(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid time {value!r}, use seconds or [HH:]MM:SS, e.g. 90 or 1:30"
+        ) from None
 
 
 def main() -> None:
@@ -628,6 +733,8 @@ def main() -> None:
             parser.error(f"--fps must be 'source' or a number, got {args.fps!r}")
         if fps > 30:
             parser.error("--fps can't be above 29.97 (PSP limit)")
+    if args.start is not None and args.end is not None and args.end <= args.start:
+        parser.error("--end must be after --start")
 
     print_title()
 
@@ -645,6 +752,8 @@ def main() -> None:
             crf=args.crf,
             fps=fps,
             hwaccel=args.hwaccel,
+            start=args.start,
+            end=args.end,
         )
 
     except VideoConverterError as e:

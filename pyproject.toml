@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools-scm>=8"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,8 @@ name = "video2psp"
 dynamic = ["version"]
 description = "CLI tool to convert videos into PSP-compatible MP4, with interactive track selection, subtitle burn-in, volume adjustment, and CRF-based quality control."
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Erick Ghuron", email = "ghuron@usp.br" }]
 classifiers = [
@@ -28,5 +30,8 @@ video2psp-gui = "video2psp.gui:launch_gui"
 
 [tool.setuptools.packages.find]
 include = ["video2psp*"]
+
+[tool.setuptools.package-data]
+video2psp = ["icon.png"]
 
 [tool.setuptools_scm]

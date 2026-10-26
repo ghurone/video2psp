@@ -11,9 +11,11 @@ from video2psp.psp import (
     default_output_path,
     escape_filter_value,
     format_frame_rate,
+    format_timestamp,
     output_frame_rate,
     parse_frame_rate,
     parse_streams,
+    parse_timestamp,
 )
 
 PROBE_DATA = {
@@ -202,3 +204,60 @@ def test_parser_fps_and_hwaccel_defaults():
     assert args.fps == "source" and args.hwaccel is True
     args = build_parser().parse_args(["in.mkv", "--fps", "25", "--no-hwaccel"])
     assert args.fps == "25" and args.hwaccel is False
+
+
+@pytest.mark.parametrize("text, seconds", [
+    ("90", 90), ("1:30", 90), ("01:02:03.5", 3723.5), (" 0:00:05 ", 5),
+])
+def test_parse_timestamp(text, seconds):
+    assert parse_timestamp(text) == seconds
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "1:60", "-5", "1:2:3:4", "inf", "1::2"])
+def test_parse_timestamp_rejects(bad):
+    with pytest.raises(ValueError):
+        parse_timestamp(bad)
+
+
+def test_format_timestamp():
+    assert format_timestamp(0) == "00:00:00"
+    assert format_timestamp(3723.5) == "01:02:03.5"
+    assert format_timestamp(1425.25) == "00:23:45.25"
+
+
+def test_build_command_trim():
+    cmd = PSPVideoConverter().build_ffmpeg_command("in.mkv", "out.mp4", 0, 0, start=90, end=120)
+    assert cmd[cmd.index("-ss") + 1] == "90.000"
+    assert cmd.index("-ss") < cmd.index("-i") < cmd.index("-t")
+    assert cmd[cmd.index("-t") + 1] == "30.000"
+
+    cmd = PSPVideoConverter().build_ffmpeg_command("in.mkv", "out.mp4", 0, 0, end=60)
+    assert "-ss" not in cmd and cmd[cmd.index("-t") + 1] == "60.000"
+
+
+def test_trimmed_subtitles_keep_original_timing():
+    cmd = PSPVideoConverter().build_ffmpeg_command("in.mkv", "out.mp4", 0, 0, subtitle_index=0, start=90)
+    vf = cmd[cmd.index("-vf") + 1]
+    assert vf.endswith(",setpts=PTS+90.000/TB,subtitles=filename=in.mkv:si=0,setpts=PTS-STARTPTS")
+
+    cmd = PSPVideoConverter().build_ffmpeg_command("in.mkv", "out.mp4", 0, 0, start=90)
+    assert "setpts" not in cmd[cmd.index("-vf") + 1]
+
+
+@pytest.mark.parametrize("start, end, message", [
+    (2000, None, "past the end"),
+    (60, 30, "after the start"),
+])
+def test_bad_trim_is_an_error(probed_converter, start, end, message):
+    converter, input_file, output_file = probed_converter
+    with pytest.raises(VideoConverterError, match=message):
+        converter.convert_video(
+            input_file, output_file, video_track=0, audio_track=0, subtitle_track=0, start=start, end=end
+        )
+
+
+def test_parser_trim():
+    args = build_parser().parse_args(["in.mkv", "--start", "1:30", "--end", "120"])
+    assert args.start == 90 and args.end == 120
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["in.mkv", "--start", "1:75"])

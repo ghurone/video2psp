@@ -1,9 +1,12 @@
-name: Publish to PyPI
+name: Release
 
-# Runs when a version tag is pushed: git tag v0.5.0 && git push origin v0.5.0
+# Runs when a version tag is pushed: git tag v0.7.0 && git push origin v0.7.0
+# It can also be started by hand (Actions tab or `gh workflow run publish.yml`)
+# to test the builds without publishing anything.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -23,8 +26,37 @@ jobs:
           name: dist
           path: dist/
 
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install . pyinstaller
+      - name: Download ffmpeg
+        shell: pwsh
+        run: |
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          Invoke-WebRequest $url -OutFile ffmpeg.zip
+          Invoke-WebRequest "$url.sha256" -OutFile ffmpeg.zip.sha256
+          $expected = (Get-Content ffmpeg.zip.sha256 -Raw).Trim()
+          $actual = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "ffmpeg checksum mismatch: $actual != $expected" }
+          Expand-Archive ffmpeg.zip "$env:RUNNER_TEMP\ffmpeg"
+      - name: Build the GUI
+        shell: pwsh
+        run: ./packaging/build_exe.ps1 -FfmpegDir (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory)[0].FullName
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-exe
+          path: dist/video2psp-gui-windows.zip
+
   publish:
-    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, windows-exe]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -35,3 +67,21 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # create the release and upload its files
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mv artifacts/windows-exe/video2psp-gui-windows.zip "video2psp-gui-${GITHUB_REF_NAME}-windows.zip"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
+            "video2psp-gui-${GITHUB_REF_NAME}-windows.zip" artifacts/dist/*

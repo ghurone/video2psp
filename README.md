@@ -1,21 +1,47 @@
 # video2psp
 
-**video2psp** is a Python CLI tool that converts videos to a PSP-compatible MP4 format, allowing you to select which audio and subtitle track to include (burned in) or optionally use an external subtitle file.
+**video2psp** converts videos to a PSP-compatible MP4 format, with a graphical interface and a command-line tool. You choose which audio and subtitle track to include (subtitles are burned in), or use an external subtitle file, and can trim the video to just the part you want.
 
 ## Installation
 
-1. Make sure you have [FFmpeg](https://ffmpeg.org/) (including `ffprobe`) installed and accessible in your system’s PATH.  
-2. Clone or download this repository and run:
-   ```bash
-   pip install .
-   ```
-   This will install **video2psp** as a console command.
+### Windows (no install needed)
 
-Or install using PyPI
+Download `video2psp-gui-<version>-windows.zip` from the [latest release](https://github.com/ghurone/video2psp/releases/latest), extract it and run `video2psp-gui.exe`. FFmpeg is already included.
+
+Windows SmartScreen may warn about an unrecognized app the first time; click **More info → Run anyway**.
+
+### Linux and macOS
+
+video2psp needs **Python 3.11+**, **FFmpeg** (with `ffprobe` and the `libx264` encoder) and **Tkinter** for the GUI. Install them with your package manager, then install video2psp with [pipx](https://pipx.pypa.io/), which keeps it in its own environment (plain `pip install` is blocked on many recent distros):
+
+| System | Dependencies |
+|---|---|
+| Debian / Ubuntu / Mint | `sudo apt install ffmpeg python3-tk pipx` |
+| Fedora | Enable [RPM Fusion](https://rpmfusion.org/Configuration), then `sudo dnf install ffmpeg python3-tkinter pipx` (Fedora's own `ffmpeg-free` has no `libx264`) |
+| Arch / Manjaro | `sudo pacman -S ffmpeg tk python-pipx` |
+| macOS ([Homebrew](https://brew.sh/)) | `brew install ffmpeg python-tk pipx` |
+
+```bash
+pipx ensurepath          # once, so the commands are found (then reopen the terminal)
+pipx install video2psp
+video2psp-gui            # or: video2psp <input_video> for the CLI
+```
+
+To update later: `pipx upgrade video2psp`.
+
+To check that your FFmpeg can encode for the PSP, `ffmpeg -hide_banner -encoders | grep libx264` should print a line.
+
+### Windows with Python
+
+If you prefer the Python package over the standalone release, install FFmpeg (e.g. `winget install Gyan.FFmpeg`) and run:
 
 ```bash
 pip install video2psp
 ```
+
+### From source
+
+Clone this repository and run `pip install .` in it.
 
 ## Usage
 
@@ -25,7 +51,7 @@ Prefer a graphical interface? Run:
 ```bash
 video2psp --gui
 ```
-(`-g` also works), or launch `video2psp-gui` to open it without a terminal window. The GUI lets you pick the input/output files, choose tracks, and tweak volume/preset/CRF/frame rate without touching the terminal.
+(`-g` also works), or launch `video2psp-gui` to open it without a terminal window. The GUI lets you pick the input/output files, trim the video, choose tracks, and tweak quality/speed/frame rate/volume without touching the terminal. It follows the Windows light/dark setting, and the button in the top-right corner switches between them.
 
 ### CLI
 
@@ -42,6 +68,10 @@ video2psp <input_video> [output_video] [options]
 - To burn an external subtitle file instead of an embedded track:
   ```bash
   video2psp movie.mkv out.mp4 --external-subs subs.srt
+  ```
+- To convert only part of the video, give a start and/or end time (seconds, `MM:SS` or `HH:MM:SS`). Burned-in subtitles stay in sync:
+  ```bash
+  video2psp movie.mkv out.mp4 --start 1:30 --end 22:10
   ```
 - To adjust audio volume (e.g. 150%):
   ```bash
@@ -76,3 +106,7 @@ video2psp <input_video> [output_video] [options]
 - 10-bit sources and anamorphic videos (e.g. DVDs) are converted to 8-bit and square pixels automatically.
 
 Feel free to contribute or customize further. Enjoy converting videos for your PSP!
+
+## License
+
+video2psp is licensed under the [GNU General Public License v3.0 or later](LICENSE). The Windows release bundles FFmpeg builds from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), which are also distributed under the GPL.

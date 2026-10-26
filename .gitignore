@@ -3,3 +3,4 @@ build
 dist
 video2psp.egg-info
 .pytest_cache
+assets/
