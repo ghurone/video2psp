@@ -23,6 +23,9 @@ Homepage = "https://github.com/ghurone/video2psp"
 [project.scripts]
 video2psp = "video2psp.psp:main"
 
+[project.gui-scripts]
+video2psp-gui = "video2psp.gui:launch_gui"
+
 [tool.setuptools.packages.find]
 include = ["video2psp*"]
 

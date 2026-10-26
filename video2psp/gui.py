@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from video2psp.psp import (
     DEFAULT_CRF,
     DEFAULT_PRESET,
+    NO_WINDOW,
     PRESETS,
     MediaInfo,
     PSPVideoConverter,
@@ -24,6 +25,7 @@ from video2psp.psp import (
     format_frame_rate,
     output_frame_rate,
     parse_frame_rate,
+    remove_partial_output,
 )
 
 VIDEO_FILETYPES = [
@@ -528,16 +530,36 @@ class PSPConverterGUI:
             self.progress.configure(mode="indeterminate")
             self.progress.start(12)
 
-        threading.Thread(target=self._run_ffmpeg, args=(cmd, self.duration), daemon=True).start()
+        threading.Thread(
+            target=self._run_ffmpeg, args=(cmd, self.duration, output_file), daemon=True
+        ).start()
 
-    def _run_ffmpeg(self, cmd: list[str], duration: float) -> None:
+    def _run_ffmpeg(self, cmd: list[str], duration: float, output_file: str) -> None:
+        """Worker thread: always reports back to the UI, even on unexpected errors,
+        so the window never gets stuck in the converting state."""
+        self.proc = None
+        try:
+            kind, payload = self._run_ffmpeg_process(cmd, duration)
+        except Exception as e:
+            if self.proc and self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait()
+            kind, payload = "convert_error", f"Unexpected error: {e}"
+
+        # Only clean up if ffmpeg actually started; otherwise the file at
+        # output_file (if any) is one the user already had.
+        if kind != "convert_done" and self.proc is not None:
+            remove_partial_output(output_file)
+        self.msg_queue.put((kind, payload))
+
+    def _run_ffmpeg_process(self, cmd: list[str], duration: float) -> tuple[str, str | None]:
         try:
             self.proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1,
+                encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
             )
         except FileNotFoundError:
-            self.msg_queue.put(("convert_error", "ffmpeg not found. Make sure it's installed and in your PATH."))
-            return
+            return "convert_error", "ffmpeg not found. Make sure it's installed and in your PATH."
 
         stderr_lines: list[str] = []
 
@@ -564,12 +586,11 @@ class PSPConverterGUI:
         stderr_thread.join(timeout=2)
 
         if self._cancel_requested:
-            self.msg_queue.put(("convert_cancelled", None))
-        elif returncode == 0:
-            self.msg_queue.put(("convert_done", None))
-        else:
-            tail = "\n".join(stderr_lines[-15:])
-            self.msg_queue.put(("convert_error", f"ffmpeg exited with code {returncode}.\n{tail}"))
+            return "convert_cancelled", None
+        if returncode == 0:
+            return "convert_done", None
+        tail = "\n".join(stderr_lines[-15:])
+        return "convert_error", f"ffmpeg exited with code {returncode}.\n{tail}"
 
     def _set_converting(self, active: bool) -> None:
         self.convert_btn.configure(state="disabled" if active else "normal")

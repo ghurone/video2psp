@@ -25,14 +25,15 @@ Prefer a graphical interface? Run:
 ```bash
 video2psp --gui
 ```
-(`-g` also works). This opens a window where you can pick the input/output files, choose tracks, and tweak volume/preset/CRF/frame rate without touching the terminal.
+(`-g` also works), or launch `video2psp-gui` to open it without a terminal window. The GUI lets you pick the input/output files, choose tracks, and tweak volume/preset/CRF/frame rate without touching the terminal.
 
 ### CLI
 
 With the tool installed, simply run:
 ```bash
-video2psp <input_video> <output_video> [options]
+video2psp <input_video> [output_video] [options]
 ```
+- If `output_video` is omitted, the output is saved next to the input with an `.mp4` extension.
 - If you do **not** specify `--video-track`, `--audio-track` or `--subtitle-track`, the script will prompt you to pick which tracks to use.  
 - To skip prompts, you can set them explicitly, for example:
   ```bash

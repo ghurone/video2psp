@@ -34,6 +34,9 @@ FPS_ALIASES = {
 # Bitmap subtitle codecs can't be rendered by the `subtitles` (libass) filter.
 IMAGE_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
 
+# Keeps ffprobe/ffmpeg from flashing a console window when launched from the GUI on Windows.
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 
 class VideoConverterError(Exception):
     """Custom exception for video converter errors."""
@@ -181,6 +184,14 @@ def default_output_path(input_file: str | Path) -> Path:
     return output
 
 
+def remove_partial_output(path: str | Path) -> None:
+    """Delete an unfinished output file so a broken video isn't left behind."""
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 class PSPVideoConverter:
     """PSP Video Converter class to handle video conversion operations."""
 
@@ -204,8 +215,11 @@ class PSPVideoConverter:
         ]
 
         try:
+            # ffprobe writes UTF-8; the Windows default (cp1252) garbles or
+            # fails on non-ASCII track titles.
             result = subprocess.run(
-                probe_cmd, capture_output=True, text=True, check=True, timeout=30
+                probe_cmd, capture_output=True, encoding="utf-8", errors="replace",
+                check=True, timeout=30, creationflags=NO_WINDOW,
             )
             return parse_streams(json.loads(result.stdout))
         except FileNotFoundError:
@@ -422,19 +436,20 @@ class PSPVideoConverter:
         subtitle_index = None
         if external_subs:
             print(f"Using external subtitles: {external_subs}")
-        elif info.subtitle:
-            if subtitle_track is None:
-                subtitle_index = self.choose_track_interactively(info.subtitle, "subtitle")
-            elif not 0 <= subtitle_track < len(info.subtitle):
-                print(f"Warning: Invalid subtitle index {subtitle_track}. No subtitles will be used.")
-            elif info.subtitle[subtitle_track].is_image_subtitle:
+        elif subtitle_track is not None:
+            if not info.subtitle:
                 raise VideoConverterError(
-                    f"Subtitle track {subtitle_track} is image-based "
-                    f"({info.subtitle[subtitle_track].codec_name}) and can't be burned. "
+                    f"Subtitle track {subtitle_track} requested, but the input file has no subtitle tracks."
+                )
+            subtitle_index = self._select_track(info.subtitle, subtitle_track, "subtitle")
+            if info.subtitle[subtitle_index].is_image_subtitle:
+                raise VideoConverterError(
+                    f"Subtitle track {subtitle_index} is image-based "
+                    f"({info.subtitle[subtitle_index].codec_name}) and can't be burned. "
                     "Convert it to SRT and use --external-subs."
                 )
-            else:
-                subtitle_index = subtitle_track
+        elif info.subtitle:
+            subtitle_index = self.choose_track_interactively(info.subtitle, "subtitle")
 
         if volume_factor != 1.0:
             print(f"Audio volume will be adjusted by factor: {volume_factor}")
@@ -463,7 +478,11 @@ class PSPVideoConverter:
                 "ffmpeg not found. Please install FFmpeg and ensure it's in your PATH."
             )
         except subprocess.CalledProcessError as e:
+            remove_partial_output(output_path)
             raise VideoConverterError(f"FFmpeg conversion failed with exit code {e.returncode}")
+        except KeyboardInterrupt:
+            remove_partial_output(output_path)
+            raise
         print("\n✓ Conversion completed successfully!")
         print(f"Output file: {output_path}")
 
@@ -572,7 +591,8 @@ Examples:
         "--fps",
         default="source",
         help="Output frame rate, e.g. 23.976, 25, 29.97 or 24000/1001 (max 29.97). "
-             "Default 'source' keeps the video's own rate, halving it if it is above 29.97"
+             "Default 'source' keeps the video's own rate, dividing it evenly if it is above 29.97 "
+             "(59.94 -> 29.97, 50 -> 25)"
     )
     parser.add_argument(
         "--hwaccel",

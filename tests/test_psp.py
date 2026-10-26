@@ -1,3 +1,4 @@
+import subprocess
 from fractions import Fraction
 from pathlib import Path
 
@@ -151,6 +152,49 @@ def test_build_command_frame_rate_and_hwaccel():
 
     cmd = converter.build_ffmpeg_command("in.mkv", "out.mp4", 0, 0, hwaccel=False)
     assert "-hwaccel" not in cmd
+
+
+@pytest.fixture
+def probed_converter(monkeypatch, tmp_path):
+    """A converter whose probe returns PROBE_DATA, plus an existing input file."""
+    converter = PSPVideoConverter()
+    monkeypatch.setattr(converter, "probe", lambda _f: parse_streams(PROBE_DATA))
+    input_file = tmp_path / "in.mkv"
+    input_file.touch()
+    return converter, str(input_file), str(tmp_path / "out.mp4")
+
+
+@pytest.mark.parametrize("subtitle_track, message", [
+    (5, "Invalid subtitle track index 5"),
+    (1, "image-based"),
+])
+def test_bad_subtitle_track_is_an_error(probed_converter, subtitle_track, message):
+    converter, input_file, output_file = probed_converter
+    with pytest.raises(VideoConverterError, match=message):
+        converter.convert_video(
+            input_file, output_file, video_track=0, audio_track=0, subtitle_track=subtitle_track
+        )
+
+
+def test_subtitle_track_without_subtitles_is_an_error(monkeypatch, probed_converter):
+    converter, input_file, output_file = probed_converter
+    no_subs = {**PROBE_DATA, "streams": [s for s in PROBE_DATA["streams"] if s["codec_type"] != "subtitle"]}
+    monkeypatch.setattr(converter, "probe", lambda _f: parse_streams(no_subs))
+    with pytest.raises(VideoConverterError, match="no subtitle tracks"):
+        converter.convert_video(input_file, output_file, video_track=0, audio_track=0, subtitle_track=0)
+
+
+def test_failed_conversion_removes_partial_output(monkeypatch, probed_converter):
+    converter, input_file, output_file = probed_converter
+
+    def fake_ffmpeg(cmd, check):
+        Path(cmd[-1]).write_bytes(b"half a video")
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(subprocess, "run", fake_ffmpeg)
+    with pytest.raises(VideoConverterError):
+        converter.convert_video(input_file, output_file, video_track=0, audio_track=0, subtitle_track=0)
+    assert not Path(output_file).exists()
 
 
 def test_parser_fps_and_hwaccel_defaults():
